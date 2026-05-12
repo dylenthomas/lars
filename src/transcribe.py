@@ -1,9 +1,9 @@
-#import numpy as np
-#import torch
-#from typing import List
+import numpy as np
+import torch
+from typing import List
 
-#from python_utils.faster_whisper import WhisperModel
-#from python_utils.ML_utils import offlineWhisperProcessor
+from python_utils.faster_whisper import WhisperModel
+from python_utils.ML_utils import offlineWhisperProcessor
 
 #device = "cuda" if torch.cuda.is_available() else "cpu"
 #print("Using device: {}".format(device))
@@ -16,7 +16,9 @@ print("Starting Whisper processor...")
 print("Starting Whisper...")
 #model = WhisperModel("small", device=device, compute_type="float32")
 
-#def transcribe(audio_buffer: List[float]) -> List[str]:
+def main(audio_buffer: List[float]) -> List[str]:
+    print("test.")
+    return []
 #    transcript = []
     
 #    numpy_buffer = np.array(audio_buffer, dtype=np.float32)

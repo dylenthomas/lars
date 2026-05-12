@@ -24,6 +24,7 @@ int main(int argc, char* argv[]) {
 
     PyObject *pFunc = PyObject_GetAttrString(pModule, "main");
     PyObject *pResult = PyObject_CallNoArgs(pFunc);
+    pResult = PyObject_CallNoArgs(pFunc);
 
     Py_DECREF(pModule);
     Py_DECREF(pFunc);

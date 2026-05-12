@@ -1,4 +1,3 @@
-#define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +10,6 @@
 #include "onnxruntime_c_api.h"
 #include "mic_access.h"
 #include "config_parser.h"
-//#include "transcripter_api.h"
 #include "fft.h"
 
 #define KEYWORD_CONF "configs/keywords.json"
@@ -156,10 +154,32 @@ int main(int argc, char *argv[]) {
     srandom(time(NULL));
 
     // Initialize Python 
-    Py_Initialize(); 
+    PyStatus status;
+    PyConfig config;
+    PyConfig_InitPythonConfig(&config);
 
-    PyObject* pModule = PyImport_Import(PyUnicode_DecodeFSDefault("transcripter"));
-    PyObject* pTranscribeFunc = PyObject_GetAttrString(pModule, "transcribe");
+    status = PyConfig_SetString(&config, &config.pythonpath_env, L"/home/dylenthomas/LiveASRonRPi-4/src:/home/dylenthomas/LiveASRonRPi-4/src/cbuild/venv/lib/python3.14/site-packages");
+    if (PyStatus_Exception(status)) { Py_ExitStatusException(status); } 
+    status = Py_InitializeFromConfig(&config);
+    if (PyStatus_Exception(status)) { Py_ExitStatusException(status); }
+    
+    PyConfig_Clear(&config);
+
+    //PyRun_SimpleString("import sys; print('sys.path:', sys.path)");
+
+    PyObject* pModule = PyImport_Import(PyUnicode_DecodeFSDefault("transcribe"));
+    if (pModule == NULL) {
+        if (PyErr_Occurred()) { PyErr_Print(); }
+        fprintf(stderr, "ERROR: Failed to import transcripter module.\n");
+        return -1;
+    }
+
+    PyObject* pTranscribeFunc = PyObject_GetAttrString(pModule, "main");
+    if (pTranscribeFunc == NULL) {
+        if (PyErr_Occurred()) { PyErr_Print(); }
+        fprintf(stderr, "ERROR: Failed to get transcribe function.\n");
+        return -1;
+    }
 
 	if (argc != 4) { printf("Args should be: VAD Model Path, Mic1 Name, Mic2 Name\n"); return 0; }
 	const char* vad_model_path = argv[1];
@@ -307,11 +327,9 @@ int main(int argc, char *argv[]) {
         // wait until both buffers are populated
         if (mic1_last_updated == *mic_data[0].updated) { continue; }
         mic1_last_updated = *mic_data[0].updated;
-        //printf("mic1 updated\n");
 
         if (mic2_last_updated == *mic_data[1].updated) { continue; }
         mic2_last_updated = *mic_data[1].updated;
-        //printf("mic2 updated\n");
 
         // get the delay of mic2 relative to mic1
         pthread_mutex_lock(mic_data[0].mutex);
@@ -381,6 +399,8 @@ int main(int argc, char *argv[]) {
         }
         else if (transcript_buffers) {
             PyObject *pArgs = PyTuple_New(transcript_buffers * MIC_BUFFER_LEN);
+            if (pArgs == NULL && PyErr_Occurred()) { PyErr_Print(); continue; }
+
             i = 0;
             while (i < transcript_buffers * MIC_BUFFER_LEN) {
                 PyTuple_SetItem(pArgs, i, PyFloat_FromDouble(long_buffer[i]));
@@ -388,7 +408,9 @@ int main(int argc, char *argv[]) {
             }
             
             PyObject *pCallArgs = PyTuple_Pack(1, pArgs);
+            if (pArgs == NULL && PyErr_Occurred()) { PyErr_Print(); continue; }
             PyObject *pResult = PyObject_Call(pTranscribeFunc, pCallArgs, NULL);
+            if (pArgs == NULL && PyErr_Occurred()) { PyErr_Print(); continue; }
 
             Py_DECREF(pArgs);
             Py_DECREF(pCallArgs);

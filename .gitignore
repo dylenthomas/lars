@@ -5,3 +5,4 @@ cmake-build*/
 CMakeFiles/
 .vscode/
 cbuild/
+__pycache__/

@@ -16,11 +16,11 @@ import tokenizers
 
 from tqdm import tqdm
 
-from utils.faster_whisper.audio import decode_audio, pad_or_trim
-from utils.faster_whisper.feature_extractor import FeatureExtractor
-from utils.faster_whisper.tokenizer import _LANGUAGE_CODES, Tokenizer
-from utils.faster_whisper.utils import download_model, format_timestamp, get_end, get_logger
-from utils.faster_whisper.vad import (
+from python_utils.faster_whisper.audio import decode_audio, pad_or_trim
+from python_utils.faster_whisper.feature_extractor import FeatureExtractor
+from python_utils.faster_whisper.tokenizer import _LANGUAGE_CODES, Tokenizer
+from python_utils.faster_whisper.utils import download_model, format_timestamp, get_end, get_logger
+from python_utils.faster_whisper.vad import (
     SpeechTimestampsMap,
     VadOptions,
     collect_chunks,
