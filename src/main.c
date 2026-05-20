@@ -407,7 +407,9 @@ int main(int argc, char *argv[]) {
                 i++;
             }
            
-            // TODO: Make this actually work
+            // TODO: Make a thread manager for transcription calls to run async
+            // Two options, make the threads in Python and return function immediately or make the threads in C
+            // I think the best option is a C managed thread for each transcription 
             PyObject *pCallArgs = PyTuple_Pack(1, pArgs);
             if (pArgs == NULL && PyErr_Occurred()) { PyErr_Print(); continue; }
             PyObject *pResult = PyObject_Call(pTranscribeFunc, pCallArgs, NULL);
@@ -425,7 +427,6 @@ int main(int argc, char *argv[]) {
         ort->ReleaseValue(outputs[0]);
         state_tensor = outputs[1];
         outputs[1] = NULL;
-
 	}
 	
 // Cleanup for program exit ------------------------------------------------------------------------

@@ -9,14 +9,15 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Using device: {}".format(device))
 
 print("Starting Whisper processor...")
-processor = offlineWhisperProcessor(config_path="utils/configs/preprocessor_config.json",
-                                    special_tokens_path="utils/configs/tokenizer_config.json",
-                                    vocab_path="utils/configs/vocab.json", device=device
+processor = offlineWhisperProcessor(config_path="/home/dylenthomas/LiveASRonRPi-4/src/python_utils/configs/preprocessor_config.json",
+                                    special_tokens_path="/home/dylenthomas/LiveASRonRPi-4/src/python_utils/configs/tokenizer_config.json",
+                                    vocab_path="/home/dylenthomas/LiveASRonRPi-4/src/python_utils/configs/vocab.json", 
+                                    device=device
                                     )
 print("Starting Whisper...")
 model = WhisperModel("small", device=device, compute_type="float32")
 
-def main(audio_buffer: List[float]) -> List[str]:
+def main(audio_buffer: List[float]):
     transcript = []
     
     numpy_buffer = np.array(audio_buffer, dtype=np.float32)
@@ -27,5 +28,3 @@ def main(audio_buffer: List[float]) -> List[str]:
         cleaned = segment.text.lstrip()
         print("[%.2fs -> %.2fs]-%s" % (segment.start, segment.end, cleaned))
         transcript.append(cleaned)
-
-    return transcript
