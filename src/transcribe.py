@@ -1,5 +1,5 @@
-import numpy as np
-import torch
+import numpy as np # pyright: ignore[reportMissingImports]
+import torch # pyright: ignore[reportMissingImports]
 from typing import List
 
 from python_utils.faster_whisper import WhisperModel

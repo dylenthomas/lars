@@ -27,7 +27,7 @@
 #define DEVICE_ID 0
 #define GPU_ALIGNMENT 0
 
-#define NUM_THREADS 2
+#define NUM_THREADS 3
 
 static volatile int keep_running = 1;
 void intHandler(int dummy) {
@@ -41,7 +41,16 @@ struct mic_thread_data {
     pthread_mutex_t* mutex;
 };
 
+struct transcribe_thread_data {
+    PyObject* pTranscribeFunc;
+    PyObject* pArgs;
+    int ready; 
+    pthread_mutex_t* mutex;
+    pthread_cond_t* cond;
+};
+
 atomic_int run_mic_threads = 0;
+atomic_int run_transcribe_thread = 0;
 
 int badStatus(OrtStatus* status, const OrtApi* ort) {
 	// Make sure the API was accessed correctly 
@@ -89,6 +98,35 @@ void* readMicData(void* ptr) {
         
         // avoid running prediction on old data
         atomic_store(args->updated, random());
+    }
+
+    return NULL;
+}
+
+void* transcribe(void* ptr) {
+    struct transcribe_thread_data* args = (struct transcribe_thread_data*)ptr;
+
+    while (run_transcribe_thread) {
+        pthread_mutex_lock(args->mutex);
+        while (!(args->ready)) {
+            // cond_wait unlocks the mutex while sleeping
+            pthread_cond_wait(args->cond, args->mutex);
+        }
+        args->ready = 0; 
+
+        PyObject *pArgs = args->pArgs;
+        args->pArgs = NULL;
+        pthread_mutex_unlock(args->mutex);
+        
+        PyObject *pCallArgs = PyTuple_Pack(1, pArgs);
+        if (pCallArgs == NULL && PyErr_Occurred()) { PyErr_Print(); Py_DECREF(pArgs); continue; }
+
+        PyObject *pResult = PyObject_Call(args->pTranscribeFunc, pCallArgs, NULL);
+        if (pResult == NULL) { PyErr_Print(); }
+        
+        Py_XDECREF(pResult);
+        Py_DECREF(pCallArgs);
+        Py_DECREF(pArgs);
     }
 
     return NULL;
@@ -228,59 +266,67 @@ int main(int argc, char *argv[]) {
 	if (ort == NULL) { fprintf(stderr, "ORT api returned nullptr!\n"); return 1; }
 
 	OrtEnv* env = NULL;
-	if (badStatus(ort->CreateEnv(ORT_LOGGING_LEVEL_VERBOSE, "onnxruntime", &env), ort)) { return 1; }
+	if (badStatus(ort->CreateEnv(ORT_LOGGING_LEVEL_VERBOSE, "onnxruntime", &env), ort)) { goto ort_env_fail; }
 
 	OrtSessionOptions* session_opts = NULL;
-	if (badStatus(ort->CreateSessionOptions(&session_opts), ort)) { return 1; }
-	if (badStatus(ort->SetIntraOpNumThreads(session_opts, 1), ort)) { return 1; }
-	if (badStatus(ort->SetInterOpNumThreads(session_opts, 1), ort)) { return 1; }
-	if (badStatus(ort->SetSessionGraphOptimizationLevel(session_opts, ORT_ENABLE_ALL), ort)) { return 1; }
+	if (badStatus(ort->CreateSessionOptions(&session_opts), ort)) { goto ort_session_opts_fail; }
+	if (badStatus(ort->SetIntraOpNumThreads(session_opts, 1), ort)) { goto ort_session_opts_fail; }
+	if (badStatus(ort->SetInterOpNumThreads(session_opts, 1), ort)) { goto ort_session_opts_fail; }
+	if (badStatus(ort->SetSessionGraphOptimizationLevel(session_opts, ORT_ENABLE_ALL), ort)) { goto ort_session_opts_fail; }
 
     OrtCUDAProviderOptionsV2* cuda_opts = NULL;
-    if (badStatus(ort->CreateCUDAProviderOptions(&cuda_opts), ort)) { return 1; }
-    if (badStatus(ort->SessionOptionsAppendExecutionProvider_CUDA_V2(session_opts, cuda_opts), ort)) { return 1; }
+    if (badStatus(ort->CreateCUDAProviderOptions(&cuda_opts), ort)) { goto ort_cuda_opts_fail; }
+    if (badStatus(ort->SessionOptionsAppendExecutionProvider_CUDA_V2(session_opts, cuda_opts), ort)) { goto ort_cuda_opts_fail; }
 
 	OrtSession* ort_session = NULL;
-	if (badStatus(ort->CreateSession(env, vad_model_path, session_opts, &ort_session), ort)) { return 1; }
+	if (badStatus(ort->CreateSession(env, vad_model_path, session_opts, &ort_session), ort)) { goto ort_session_fail; }
 
 	OrtRunOptions* ort_run_opts = NULL;
-	if (badStatus(ort->CreateRunOptions(&ort_run_opts), ort)) { return 1; }
+	if (badStatus(ort->CreateRunOptions(&ort_run_opts), ort)) { goto ort_session_fail; }
 
     OrtMemoryInfo* gpu_mem_info = NULL;
     if (badStatus(ort->CreateMemoryInfo_V2("Cuda", OrtMemoryInfoDeviceType_GPU, VENDOR_ID, DEVICE_ID,
-            OrtMemTypeDefault, GPU_ALIGNMENT, OrtDeviceAllocator, &gpu_mem_info), ort)) { return 1; }
+            OrtMemTypeDefault, GPU_ALIGNMENT, OrtDeviceAllocator, &gpu_mem_info), ort)) { goto ort_gpu_mem_info_fail; }
 
 	OrtMemoryInfo* cpu_mem_info = NULL;
-	if (badStatus(ort->CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault, &cpu_mem_info), ort)) { return 1; }
+	if (badStatus(ort->CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault, &cpu_mem_info), ort)) { goto ort_cpu_mem_info_fail; }
 
 	OrtAllocator* alloc = NULL;
-	if (badStatus(ort->GetAllocatorWithDefaultOptions(&alloc), ort)) { return 1; }
+	if (badStatus(ort->GetAllocatorWithDefaultOptions(&alloc), ort)) { goto ort_cpu_mem_info_fail; }
 	
 	if (badStatus(ort->CreateTensorWithDataAsOrtValue(
 		gpu_mem_info, sample_rate, sizeof(sample_rate), sample_rate_shape, SAMPLE_RATE_DIMS,
-		ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &sr_tensor), ort)) { return 1; }
+		ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &sr_tensor), ort)) { goto ort_sr_tensor_fail; }
 
 	// create initializing state for model of all zeros 
 	if (badStatus(ort->CreateTensorWithDataAsOrtValue(
 		gpu_mem_info, initial_state, sizeof(initial_state), state_data_shape, STATE_DIMS,
-		ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &state_tensor), ort)) { return 1; }
+		ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &state_tensor), ort)) { goto ort_state_tensor_fail; }
 
 	if (badStatus(ort->CreateTensorWithDataAsOrtValue(
 		gpu_mem_info, combined_buffer, sizeof(combined_buffer), input_data_shape, INPUT_DIMS, 
-		ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor), ort)) { return 1; }
+		ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor), ort)) { goto ort_input_tensor_fail; }
 
     OrtIoBinding* io_binding = NULL;
-    if (badStatus(ort->CreateIoBinding(ort_session, &io_binding), ort)) { return 1; }
+    if (badStatus(ort->CreateIoBinding(ort_session, &io_binding), ort)) { goto ort_io_binding_fail; }
 
-    if (badStatus(ort->BindInput(io_binding, "input", input_tensor), ort)) { return 1; }
-    if (badStatus(ort->BindInput(io_binding, "state", state_tensor), ort)) { return 1; }
-    if (badStatus(ort->BindInput(io_binding, "sr", sr_tensor), ort)) { return 1; }
-    if (badStatus(ort->BindOutputToDevice(io_binding, "output", cpu_mem_info), ort)) { return 1; }
-    if (badStatus(ort->BindOutputToDevice(io_binding, "stateN", cpu_mem_info), ort)) { return 1; }
+    if (badStatus(ort->BindInput(io_binding, "input", input_tensor), ort)) { goto ort_io_binding_fail; }
+    if (badStatus(ort->BindInput(io_binding, "state", state_tensor), ort)) { goto ort_io_binding_fail; }
+    if (badStatus(ort->BindInput(io_binding, "sr", sr_tensor), ort)) { goto ort_io_binding_fail; }
+    if (badStatus(ort->BindOutputToDevice(io_binding, "output", cpu_mem_info), ort)) { goto ort_io_binding_fail; }
+    if (badStatus(ort->BindOutputToDevice(io_binding, "stateN", cpu_mem_info), ort)) { goto ort_io_binding_fail; }
 // -------------------------------------------------------------------------------------------------
-// Initialize Microphone ---------------------------------------------------------------------------
-    int i;
+// Initialize Transcriber --------------------------------------------------------------------------
+    struct transcribe_thread_data transcribe_data;
 
+    pthread_mutex_t transcribe_mutex1 = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t transcribe_cond1 = PTHREAD_COND_INITIALIZER;
+
+    transcribe_data.pTranscribeFunc = pTranscribeFunc;
+    transcribe_data.ready = 0;
+    transcribe_data.mutex = &transcribe_mutex1;
+    transcribe_data.cond = &transcribe_cond1;
+// Initialize Microphone ---------------------------------------------------------------------------
 	printf("Initializing microphones...\n");
 
 	snd_pcm_t* mic1_ch;
@@ -291,38 +337,50 @@ int main(int argc, char *argv[]) {
 
     struct mic_thread_data mic_data[2];
 
-    pthread_mutex_t mutex1 = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_t mutex2 = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t mic_mutex1 = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t mic_mutex2 = PTHREAD_MUTEX_INITIALIZER;
 
     mic_data[0].buffer = mic1_buffer;
     mic_data[0].device = mic1_ch;
     mic_data[0].updated = &updated1;
-    mic_data[0].mutex = &mutex1;
+    mic_data[0].mutex = &mic_mutex1;
     mic_data[1].buffer = mic2_buffer;
     mic_data[1].device = mic2_ch;
     mic_data[1].updated = &updated2;
-    mic_data[1].mutex = &mutex2;
+    mic_data[1].mutex = &mic_mutex2;
 // -------------------------------------------------------------------------------------------------
-	printf("Starting audio collection.\n");
-
+// Initialize threads ------------------------------------------------------------------------------	
     pthread_t thread[NUM_THREADS];
-    run_mic_threads = 1;
 
-    if ((ret = pthread_create(&thread[0], NULL, readMicData, &mic_data[0])) != 0) { 
-        fprintf(stderr, "Error: failed to create thread 1 %d", ret);
-        return 1; 
+    printf("Starting transcription thread.\n");
+    run_transcribe_thread = 1;
+    
+    if ((ret = pthread_create(&thread[0], NULL, transcribe, &transcribe_data)) != 0) {
+        fprintf(stderr, "Error: failed to create transcription thread %d", ret);
+        goto transcribe_thread_fail;
+    }
+    printf("Started transcription thread.\n");
+    
+    printf("Starting audio threads.\n");
+    run_mic_threads = 1;
+    
+    if ((ret = pthread_create(&thread[1], NULL, readMicData, &mic_data[0])) != 0) { 
+        fprintf(stderr, "Error: failed to create first mic thread %d", ret);
+        goto first_mic_thread_fail;
     }
     printf("Started mic1 thread.\n");
 
-    if ((ret = pthread_create(&thread[1], NULL, readMicData, &mic_data[1])) != 0) { 
-        fprintf(stderr, "Error: failed to create thread 2 %d", ret);
-        return 1; 
+    if ((ret = pthread_create(&thread[2], NULL, readMicData, &mic_data[1])) != 0) { 
+        fprintf(stderr, "Error: failed to create second mic thread %d", ret);
+        goto second_mic_thread_fail;
     }
     printf("Started mic2 thread.\n");
 
     mic1_last_updated = *mic_data[0].updated;
     mic2_last_updated = *mic_data[1].updated;
-    
+// -------------------------------------------------------------------------------------------------
+    int i;
+
     while (keep_running) {
         // wait until both buffers are populated
         if (mic1_last_updated == *mic_data[0].updated) { continue; }
@@ -406,18 +464,13 @@ int main(int argc, char *argv[]) {
                 PyTuple_SetItem(pArgs, i, PyFloat_FromDouble(long_buffer[i]));
                 i++;
             }
-           
-            // TODO: Make a thread manager for transcription calls to run async
-            // Two options, make the threads in Python and return function immediately or make the threads in C
-            // I think the best option is a C managed thread for each transcription 
-            PyObject *pCallArgs = PyTuple_Pack(1, pArgs);
-            if (pArgs == NULL && PyErr_Occurred()) { PyErr_Print(); continue; }
-            PyObject *pResult = PyObject_Call(pTranscribeFunc, pCallArgs, NULL);
-            if (pArgs == NULL && PyErr_Occurred()) { PyErr_Print(); continue; }
 
-            Py_DECREF(pArgs);
-            Py_DECREF(pCallArgs);
-            Py_DECREF(pResult);
+            pthread_mutex_lock(transcribe_data.mutex);
+            transcribe_data.pArgs = pArgs;
+            transcribe_data.ready = 1;
+            pthread_cond_signal(transcribe_data.cond);
+            pthread_mutex_unlock(transcribe_data.mutex);
+           
             memset(long_buffer, 0, sizeof(long_buffer));
             transcript_buffers = 0;
         }
@@ -430,31 +483,57 @@ int main(int argc, char *argv[]) {
 	}
 	
 // Cleanup for program exit ------------------------------------------------------------------------
-    printf("cleaning up..\n");
-
+second_mic_thread_fail:
+    printf("Cleaning up second mic.\n");
     run_mic_threads = 0;
+    pthread_join(thread[2], NULL);
+    close_mic(mic2_ch);
+
+first_mic_thread_fail:
+    printf("Cleaning up first mic.\n");
+    run_mic_threads = 0;
+    pthread_join(thread[1], NULL);
+	close_mic(mic1_ch);
+
+transcribe_thread_fail:
+    printf("Cleaning up transcriber.\n");
+    run_transcribe_thread = 0;
+    pthread_mutex_lock(transcribe_data.mutex);
+    pthread_cond_signal(transcribe_data.cond);
+    pthread_mutex_unlock(transcribe_data.mutex);
+    pthread_join(thread[0], NULL);
+   
     keep_running = 0;
 
-	ort->ReleaseMemoryInfo(cpu_mem_info);
-    ort->ReleaseMemoryInfo(gpu_mem_info);
+    printf("Cleaning up ORT.\n");
+ort_io_binding_fail:
     ort->ReleaseIoBinding(io_binding);
+ort_input_tensor_fail:
+    ort->ReleaseValue(input_tensor);
+ort_state_tensor_fail:
+    ort->ReleaseValue(state_tensor);
+ort_sr_tensor_fail:
+    ort->ReleaseValue(sr_tensor);
+ort_cpu_mem_info_fail:
+	ort->ReleaseMemoryInfo(cpu_mem_info);
+ort_gpu_mem_info_fail:
+    ort->ReleaseMemoryInfo(gpu_mem_info);
+ort_session_fail:
 	ort->ReleaseSession(ort_session);
+ort_cuda_opts_fail:
     ort->ReleaseCUDAProviderOptions(cuda_opts);
+ort_session_opts_fail:
 	ort->ReleaseSessionOptions(session_opts);
+ort_env_fail:
 	ort->ReleaseEnv(env);
     printf("Released all ORT bindings.\n");
 
-    pthread_join(thread[0], NULL);
-    pthread_join(thread[1], NULL);
-    printf("Joined threads.\n");
-
-	close_mic(mic1_ch);
-    close_mic(mic2_ch);
-    printf("Closed mics.\n");
-
+    printf("Cleaning up Python.\n");
     Py_DECREF(pTranscribeFunc);
     Py_DECREF(pModule);
     Py_Finalize();
+    printf("Released Python.\n");
 
+    printf("Exiting program.\n");
 	return 0;
 }
