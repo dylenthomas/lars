@@ -450,6 +450,9 @@ MIC_LIB:FILEPATH=/home/dylenthomas/LiveASRonRPi-4/libs/libmic_access.so
 //Path to a library.
 ORT_LIB:FILEPATH=/home/dylenthomas/LiveASRonRPi-4/libs/onnxruntime/libonnxruntime.so
 
+//Path to a library.
+SHERPA_LIB:FILEPATH=/home/dylenthomas/LiveASRonRPi-4/libs/sherpa-onnx/libsherpa-onnx-c-api.so
+
 
 ########################
 # INTERNAL cache entries

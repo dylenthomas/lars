@@ -1,4 +1,4 @@
-#include <Python.h>
+//#include <Python.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -11,6 +11,7 @@
 #include "mic_access.h"
 #include "config_parser.h"
 #include "fft.h"
+#include "sherpa-onnx/c-api/c-api.h"
 
 #define KEYWORD_CONF "configs/keywords.json"
 #define MIC_BUFFER_LEN 512 
@@ -27,7 +28,7 @@
 #define DEVICE_ID 0
 #define GPU_ALIGNMENT 0
 
-#define NUM_THREADS 3
+#define NUM_THREADS 2
 
 static volatile int keep_running = 1;
 void intHandler(int dummy) {
@@ -41,16 +42,13 @@ struct mic_thread_data {
     pthread_mutex_t* mutex;
 };
 
-struct transcribe_thread_data {
-    PyObject* pTranscribeFunc;
-    PyObject* pArgs;
-    int ready; 
-    pthread_mutex_t* mutex;
-    pthread_cond_t* cond;
-};
-
 atomic_int run_mic_threads = 0;
-atomic_int run_transcribe_thread = 0;
+
+const char* encoder_filename = "/home/dylenthomas/LiveASRonRPi-4/.model/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/encoder-epoch-99-avg-1.onnx";
+const char* decoder_filename = "/home/dylenthomas/LiveASRonRPi-4/.model/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/decoder-epoch-99-avg-1.onnx";
+const char* joiner_filename = "/home/dylenthomas/LiveASRonRPi-4/.model/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/joiner-epoch-99-avg-1.onnx";
+const char* tokens_filename = "/home/dylenthomas/LiveASRonRPi-4/.model/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/tokens.txt";
+const char* provider = "cpu"; 
 
 int badStatus(OrtStatus* status, const OrtApi* ort) {
 	// Make sure the API was accessed correctly 
@@ -98,35 +96,6 @@ void* readMicData(void* ptr) {
         
         // avoid running prediction on old data
         atomic_store(args->updated, random());
-    }
-
-    return NULL;
-}
-
-void* transcribe(void* ptr) {
-    struct transcribe_thread_data* args = (struct transcribe_thread_data*)ptr;
-
-    while (run_transcribe_thread) {
-        pthread_mutex_lock(args->mutex);
-        while (!(args->ready)) {
-            // cond_wait unlocks the mutex while sleeping
-            pthread_cond_wait(args->cond, args->mutex);
-        }
-        args->ready = 0; 
-
-        PyObject *pArgs = args->pArgs;
-        args->pArgs = NULL;
-        pthread_mutex_unlock(args->mutex);
-        
-        PyObject *pCallArgs = PyTuple_Pack(1, pArgs);
-        if (pCallArgs == NULL && PyErr_Occurred()) { PyErr_Print(); Py_DECREF(pArgs); continue; }
-
-        PyObject *pResult = PyObject_Call(args->pTranscribeFunc, pCallArgs, NULL);
-        if (pResult == NULL) { PyErr_Print(); }
-        
-        Py_XDECREF(pResult);
-        Py_DECREF(pCallArgs);
-        Py_DECREF(pArgs);
     }
 
     return NULL;
@@ -191,42 +160,36 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, intHandler);
     srandom(time(NULL));
 
-    // Initialize Python 
-    PyStatus status;
-    PyConfig config;
-    PyConfig_InitPythonConfig(&config);
+    SherpaOnnxOnlineRecognizerConfig recognizer_config;
+    memset(&recognizer_config, 0, sizeof(recognizer_config));
+    recognizer_config.decoding_method = "greedy_search";
+    recognizer_config.model_config.debug = 1;
+    recognizer_config.model_config.num_threads = 1;
+    recognizer_config.model_config.provider = provider;
+    recognizer_config.model_config.tokens = tokens_filename;
+    recognizer_config.model_config.transducer.encoder = encoder_filename;
+    recognizer_config.model_config.transducer.decoder = decoder_filename;
+    recognizer_config.model_config.transducer.joiner = joiner_filename;
+    recognizer_config.enable_endpoint = 1;
 
-    status = PyConfig_SetString(&config, &config.pythonpath_env, L"/home/dylenthomas/LiveASRonRPi-4/src:/home/dylenthomas/LiveASRonRPi-4/src/cbuild/venv/lib/python3.14/site-packages");
-    if (PyStatus_Exception(status)) { Py_ExitStatusException(status); } 
-    status = Py_InitializeFromConfig(&config);
-    if (PyStatus_Exception(status)) { Py_ExitStatusException(status); }
-    
-    PyConfig_Clear(&config);
-
-    //PyRun_SimpleString("import sys; print('sys.path:', sys.path)");
-
-    PyObject* pModule = PyImport_Import(PyUnicode_DecodeFSDefault("transcribe"));
-    if (pModule == NULL) {
-        if (PyErr_Occurred()) { PyErr_Print(); }
-        fprintf(stderr, "ERROR: Failed to import transcripter module.\n");
+    const SherpaOnnxOnlineRecognizer* sherpa_recognizer = SherpaOnnxCreateOnlineRecognizer(&recognizer_config);
+    if (sherpa_recognizer == NULL) {
+        fprintf(stderr, "Please check your config!\n");
         return -1;
     }
+    const SherpaOnnxOnlineStream* sherpa_stream = SherpaOnnxCreateOnlineStream(sherpa_recognizer);
 
-    PyObject* pTranscribeFunc = PyObject_GetAttrString(pModule, "main");
-    if (pTranscribeFunc == NULL) {
-        if (PyErr_Occurred()) { PyErr_Print(); }
-        fprintf(stderr, "ERROR: Failed to get transcribe function.\n");
-        return -1;
-    }
+    const SherpaOnnxDisplay *display = SherpaOnnxCreateDisplay(50);
+    int32_t segment_id = 0;
 
-	if (argc != 4) { printf("Args should be: VAD Model Path, Mic1 Name, Mic2 Name\n"); return 0; }
+    if (argc != 4) { printf("Args should be: VAD Model Path, Mic1 Name, Mic2 Name\n"); return 0; }
 	const char* vad_model_path = argv[1];
 	const char* mic1_name = argv[2];
     const char* mic2_name = argv[3];
 
     //struct keywordHM keywords = createKeywordHM(KEYWORD_CONF);
 
-	const float speech_threshold = 0.7; // trigger threshold to start transcription
+	const float speech_threshold = 0.5; // trigger threshold to start transcription
     size_t num_outputs = 2;
     
     double peak_value = 0.0f;
@@ -315,17 +278,6 @@ int main(int argc, char *argv[]) {
     if (badStatus(ort->BindInput(io_binding, "sr", sr_tensor), ort)) { goto ort_io_binding_fail; }
     if (badStatus(ort->BindOutputToDevice(io_binding, "output", cpu_mem_info), ort)) { goto ort_io_binding_fail; }
     if (badStatus(ort->BindOutputToDevice(io_binding, "stateN", cpu_mem_info), ort)) { goto ort_io_binding_fail; }
-// -------------------------------------------------------------------------------------------------
-// Initialize Transcriber --------------------------------------------------------------------------
-    struct transcribe_thread_data transcribe_data;
-
-    pthread_mutex_t transcribe_mutex1 = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t transcribe_cond1 = PTHREAD_COND_INITIALIZER;
-
-    transcribe_data.pTranscribeFunc = pTranscribeFunc;
-    transcribe_data.ready = 0;
-    transcribe_data.mutex = &transcribe_mutex1;
-    transcribe_data.cond = &transcribe_cond1;
 // Initialize Microphone ---------------------------------------------------------------------------
 	printf("Initializing microphones...\n");
 
@@ -348,29 +300,19 @@ int main(int argc, char *argv[]) {
     mic_data[1].device = mic2_ch;
     mic_data[1].updated = &updated2;
     mic_data[1].mutex = &mic_mutex2;
-// -------------------------------------------------------------------------------------------------
 // Initialize threads ------------------------------------------------------------------------------	
     pthread_t thread[NUM_THREADS];
-
-    printf("Starting transcription thread.\n");
-    run_transcribe_thread = 1;
-    
-    if ((ret = pthread_create(&thread[0], NULL, transcribe, &transcribe_data)) != 0) {
-        fprintf(stderr, "Error: failed to create transcription thread %d", ret);
-        goto transcribe_thread_fail;
-    }
-    printf("Started transcription thread.\n");
     
     printf("Starting audio threads.\n");
     run_mic_threads = 1;
     
-    if ((ret = pthread_create(&thread[1], NULL, readMicData, &mic_data[0])) != 0) { 
+    if ((ret = pthread_create(&thread[0], NULL, readMicData, &mic_data[0])) != 0) { 
         fprintf(stderr, "Error: failed to create first mic thread %d", ret);
         goto first_mic_thread_fail;
     }
     printf("Started mic1 thread.\n");
 
-    if ((ret = pthread_create(&thread[2], NULL, readMicData, &mic_data[1])) != 0) { 
+    if ((ret = pthread_create(&thread[1], NULL, readMicData, &mic_data[1])) != 0) { 
         fprintf(stderr, "Error: failed to create second mic thread %d", ret);
         goto second_mic_thread_fail;
     }
@@ -445,36 +387,53 @@ int main(int argc, char *argv[]) {
             iterations_decayed++;
         }
         
-        printf("%.2f\n", peak_value);
+        //printf("%.2f\n", peak_value);
+
+        // TODO: Have this make a wav file so I can hear what is going on
+        // There is something going on with the microphone buffer combining, becuase it works much better with the single mic
 
         if (peak_value >= speech_threshold) {
-            i = 0;
-            while (i < MIC_BUFFER_LEN) { 
-                long_buffer[i + MIC_BUFFER_LEN * transcript_buffers] = combined_buffer[i]; 
-                i++; 
-            }
-            transcript_buffers++;
-        }
-        else if (transcript_buffers) {
-            PyObject *pArgs = PyTuple_New(transcript_buffers * MIC_BUFFER_LEN);
-            if (pArgs == NULL && PyErr_Occurred()) { PyErr_Print(); continue; }
+            SherpaOnnxOnlineStreamAcceptWaveform(sherpa_stream, SAMPLE_RATE, mic_data[0].buffer, MIC_BUFFER_LEN);
 
-            i = 0;
-            while (i < transcript_buffers * MIC_BUFFER_LEN) {
-                PyTuple_SetItem(pArgs, i, PyFloat_FromDouble(long_buffer[i]));
-                i++;
+            while (SherpaOnnxIsOnlineStreamReady(sherpa_recognizer, sherpa_stream)) {
+                SherpaOnnxDecodeOnlineStream(sherpa_recognizer, sherpa_stream);
             }
 
-            pthread_mutex_lock(transcribe_data.mutex);
-            transcribe_data.pArgs = pArgs;
-            transcribe_data.ready = 1;
-            pthread_cond_signal(transcribe_data.cond);
-            pthread_mutex_unlock(transcribe_data.mutex);
+            const SherpaOnnxOnlineRecognizerResult* r = SherpaOnnxGetOnlineStreamResult(sherpa_recognizer, sherpa_stream);
            
-            memset(long_buffer, 0, sizeof(long_buffer));
-            transcript_buffers = 0;
-        }
+            if (strlen(r->text)) {
+                SherpaOnnxPrint(display, segment_id, r->text);
+            }
 
+            if (SherpaOnnxOnlineStreamIsEndpoint(sherpa_recognizer, sherpa_stream)) {
+                if (strlen(r->text)) { ++segment_id; }
+                SherpaOnnxOnlineStreamReset(sherpa_recognizer, sherpa_stream);
+            }
+            
+            SherpaOnnxDestroyOnlineRecognizerResult(r);
+        }
+        else { 
+            float tail_padding[4800] = {0};
+            SherpaOnnxOnlineStreamAcceptWaveform(sherpa_stream, SAMPLE_RATE, tail_padding, 4800);
+            
+            SherpaOnnxOnlineStreamInputFinished(sherpa_stream);
+            
+            while (SherpaOnnxIsOnlineStreamReady(sherpa_recognizer, sherpa_stream)) {
+                SherpaOnnxDecodeOnlineStream(sherpa_recognizer, sherpa_stream);
+            }
+
+            const SherpaOnnxOnlineRecognizerResult* r = SherpaOnnxGetOnlineStreamResult(sherpa_recognizer, sherpa_stream);
+            
+            if (strlen(r->text)) { 
+                SherpaOnnxPrint(display, segment_id, r->text);
+            }
+
+            SherpaOnnxDestroyOnlineRecognizerResult(r);
+            SherpaOnnxOnlineStreamReset(sherpa_recognizer, sherpa_stream);
+
+            segment_id = 0;
+        }
+        
         // Cleanup iteration
         ort->ReleaseValue(state_tensor);
         ort->ReleaseValue(outputs[0]);
@@ -486,23 +445,15 @@ int main(int argc, char *argv[]) {
 second_mic_thread_fail:
     printf("Cleaning up second mic.\n");
     run_mic_threads = 0;
-    pthread_join(thread[2], NULL);
+    pthread_join(thread[1], NULL);
     close_mic(mic2_ch);
 
 first_mic_thread_fail:
     printf("Cleaning up first mic.\n");
     run_mic_threads = 0;
-    pthread_join(thread[1], NULL);
+    pthread_join(thread[0], NULL);
 	close_mic(mic1_ch);
 
-transcribe_thread_fail:
-    printf("Cleaning up transcriber.\n");
-    run_transcribe_thread = 0;
-    pthread_mutex_lock(transcribe_data.mutex);
-    pthread_cond_signal(transcribe_data.cond);
-    pthread_mutex_unlock(transcribe_data.mutex);
-    pthread_join(thread[0], NULL);
-   
     keep_running = 0;
 
     printf("Cleaning up ORT.\n");
@@ -528,12 +479,16 @@ ort_env_fail:
 	ort->ReleaseEnv(env);
     printf("Released all ORT bindings.\n");
 
-    printf("Cleaning up Python.\n");
-    Py_DECREF(pTranscribeFunc);
-    Py_DECREF(pModule);
-    Py_Finalize();
-    printf("Released Python.\n");
+    //printf("Cleaning up Python.\n");
+    //Py_DECREF(pTranscribeFunc);
+    //Py_DECREF(pModule);
+    //Py_Finalize();
+    //printf("Released Python.\n");
 
+    SherpaOnnxDestroyDisplay(display);
+    SherpaOnnxDestroyOnlineStream(sherpa_stream);
+    SherpaOnnxDestroyOnlineRecognizer(sherpa_recognizer);
+    
     printf("Exiting program.\n");
 	return 0;
 }
