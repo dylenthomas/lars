@@ -1,4 +1,3 @@
-//#include <Python.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -172,12 +171,25 @@ int main(int argc, char *argv[]) {
     recognizer_config.model_config.transducer.joiner = joiner_filename;
     recognizer_config.enable_endpoint = 1;
 
+    SherpaOnnxOnlineSpeechDenoiserConfig denoiser_config;
+    memset(&denoiser_config, 0, sizeof(denoiser_config));
+    denoiser_config.model.dpdfnet.model = "/home/dylenthomas/LiveASRonRPi-4/.model/dpdfnet8.onnx";
+    denoiser_config.model.num_threads = 1;
+    denoiser_config.model.debug = 0;
+    denoiser_config.model.provider = "cpu";
+
     const SherpaOnnxOnlineRecognizer* sherpa_recognizer = SherpaOnnxCreateOnlineRecognizer(&recognizer_config);
     if (sherpa_recognizer == NULL) {
         fprintf(stderr, "Please check your config!\n");
-        return -1;
+        goto sherpa_recognizer_fail;
     }
     const SherpaOnnxOnlineStream* sherpa_stream = SherpaOnnxCreateOnlineStream(sherpa_recognizer);
+
+    const SherpaOnnxOnlineSpeechDenoiser* sd = SherpaOnnxCreateOnlineSpeechDenoiser(&denoiser_config);
+    if (sd == NULL) {
+        fprintf(stderr, "Failed to create speech denoiser\n");
+        goto sherpa_denoiser_fail;
+    }
 
     const SherpaOnnxDisplay *display = SherpaOnnxCreateDisplay(50);
     int32_t segment_id = 0;
@@ -213,6 +225,9 @@ int main(int argc, char *argv[]) {
     float combined_buffer[MIC_BUFFER_LEN] = {0};
     float long_buffer[SAMPLE_RATE * LONGEST_TRANSCRIPT] = {0};
 	float initial_state[STATE_LEN] = {0};
+
+    int long_buffer_size = 0;
+    int long_buffer_capacity = SAMPLE_RATE * LONGEST_TRANSCRIPT;
 
 	OrtValue* input_tensor = NULL;
 	OrtValue* state_tensor = NULL;
@@ -341,6 +356,16 @@ int main(int argc, char *argv[]) {
 
         int delay = findSampleDelay(mic_data[0].buffer, mic_data[1].buffer);
 
+        // Audio reached mic 2 first
+        if (delay < 0) { 
+            memcpy(combined_buffer, mic_data[1].buffer, MIC_BUFFER_LEN * sizeof(float));
+        }
+        // Audio reached mic 1 first
+        else { 
+            memcpy(combined_buffer, mic_data[0].buffer, MIC_BUFFER_LEN * sizeof(float));     
+        }
+
+        /*
         fft(X, MIC_BUFFER_LEN, tmp);
         fft(Y, MIC_BUFFER_LEN, tmp);
 
@@ -361,15 +386,23 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < MIC_BUFFER_LEN; i++) {
             combined_buffer[i] = combined[i].Re / MIC_BUFFER_LEN;
         }
+        */
 
         pthread_mutex_unlock(mic_data[0].mutex);
         pthread_mutex_unlock(mic_data[1].mutex);
 
 		float speech_prob;
         OrtValue** outputs = NULL;
+            
+        const SherpaOnnxDenoisedAudio* chunk = SherpaOnnxOnlineSpeechDenoiserRun(sd, combined_buffer, MIC_BUFFER_LEN, SAMPLE_RATE);
+        if (chunk == NULL) { goto end_loop; }
+        //memcpy(combined_buffer, chunk->samples, chunk->n * sizeof(float));
+        //if (chunk->n < MIC_BUFFER_LEN) {
+        //    memset(combined_buffer + chunk->n, 0, (MIC_BUFFER_LEN - chunk->n) * sizeof(float));
+        //}
 
 		speech_prob = getSpeechProb(&outputs, num_outputs, ort, ort_session, ort_run_opts, io_binding, alloc);
-        if (speech_prob == -1.0f) { continue; } // if VAD failed just skip the iteration 
+        if (speech_prob == -1.0f) { goto end_loop; } // if VAD failed just skip the iteration 
         
         if (speech_prob > peak_value) {
         // Increase
@@ -387,58 +420,82 @@ int main(int argc, char *argv[]) {
             iterations_decayed++;
         }
         
-        //printf("%.2f\n", peak_value);
-
-        // TODO: Have this make a wav file so I can hear what is going on
-        // There is something going on with the microphone buffer combining, becuase it works much better with the single mic
+        printf("%.2f\n", peak_value);
 
         if (peak_value >= speech_threshold) {
-            SherpaOnnxOnlineStreamAcceptWaveform(sherpa_stream, SAMPLE_RATE, mic_data[0].buffer, MIC_BUFFER_LEN);
+            int samples_to_copy = chunk->n;
+            if (long_buffer_size + samples_to_copy > long_buffer_capacity) {
+                samples_to_copy = long_buffer_capacity - long_buffer_size;
+            }
+            memcpy(long_buffer + long_buffer_size, chunk->samples, samples_to_copy * sizeof(float));
+            long_buffer_size += samples_to_copy;
 
+
+            SherpaOnnxOnlineStreamAcceptWaveform(sherpa_stream, chunk->sample_rate, chunk->samples, chunk->n);
             while (SherpaOnnxIsOnlineStreamReady(sherpa_recognizer, sherpa_stream)) {
                 SherpaOnnxDecodeOnlineStream(sherpa_recognizer, sherpa_stream);
             }
 
             const SherpaOnnxOnlineRecognizerResult* r = SherpaOnnxGetOnlineStreamResult(sherpa_recognizer, sherpa_stream);
-           
-            if (strlen(r->text)) {
-                SherpaOnnxPrint(display, segment_id, r->text);
-            }
+            if (strlen(r->text)) { printf("%s\n", r->text); }
 
             if (SherpaOnnxOnlineStreamIsEndpoint(sherpa_recognizer, sherpa_stream)) {
                 if (strlen(r->text)) { ++segment_id; }
                 SherpaOnnxOnlineStreamReset(sherpa_recognizer, sherpa_stream);
             }
-            
             SherpaOnnxDestroyOnlineRecognizerResult(r);
+            
+            if (long_buffer_size >= long_buffer_capacity) {
+                printf("Reached capacity\n");
+                SherpaOnnxWriteWave(long_buffer, long_buffer_size, SAMPLE_RATE, "/home/dylenthomas/LiveASRonRPi-4/wavs/transcript.wav");
+                long_buffer_size = 0;
+                peak_value = 0.0;
+            }
         }
-        else { 
+        else { // TODO: Make this only run if we previously had speech.f
+            const SherpaOnnxDenoisedAudio* tail = SherpaOnnxOnlineSpeechDenoiserFlush(sd);
+            if (tail) { 
+                int samples_to_copy = tail->n;
+                if (long_buffer_size + samples_to_copy > long_buffer_capacity) {
+                    samples_to_copy = long_buffer_capacity - long_buffer_size;
+                }
+                memcpy(long_buffer + long_buffer_size, tail->samples, samples_to_copy * sizeof(float));
+                long_buffer_size += samples_to_copy;
+
+                SherpaOnnxOnlineStreamAcceptWaveform(sherpa_stream, tail->sample_rate, tail->samples, tail->n);
+                SherpaOnnxDestroyDenoisedAudio(tail); 
+            }
+            
+            // Only write if we actually accumulated something
+            if (long_buffer_size > 0) {
+                printf("Reached end of speech and logged audio\n");
+                SherpaOnnxWriteWave(long_buffer, long_buffer_size, SAMPLE_RATE, "/home/dylenthomas/LiveASRonRPi-4/wavs/transcript.wav");
+                long_buffer_size = 0;
+            }
+            
             float tail_padding[4800] = {0};
             SherpaOnnxOnlineStreamAcceptWaveform(sherpa_stream, SAMPLE_RATE, tail_padding, 4800);
-            
             SherpaOnnxOnlineStreamInputFinished(sherpa_stream);
-            
             while (SherpaOnnxIsOnlineStreamReady(sherpa_recognizer, sherpa_stream)) {
                 SherpaOnnxDecodeOnlineStream(sherpa_recognizer, sherpa_stream);
             }
 
             const SherpaOnnxOnlineRecognizerResult* r = SherpaOnnxGetOnlineStreamResult(sherpa_recognizer, sherpa_stream);
-            
-            if (strlen(r->text)) { 
-                SherpaOnnxPrint(display, segment_id, r->text);
-            }
-
-            SherpaOnnxDestroyOnlineRecognizerResult(r);
-            SherpaOnnxOnlineStreamReset(sherpa_recognizer, sherpa_stream);
+            if (strlen(r->text)) { printf("%s\n", r->text); }
 
             segment_id = 0;
+            peak_value = 0.0;
+            SherpaOnnxDestroyOnlineRecognizerResult(r);
+            SherpaOnnxOnlineStreamReset(sherpa_recognizer, sherpa_stream);
         }
         
         // Cleanup iteration
+end_loop:
         ort->ReleaseValue(state_tensor);
         ort->ReleaseValue(outputs[0]);
         state_tensor = outputs[1];
         outputs[1] = NULL;
+        SherpaOnnxDestroyDenoisedAudio(chunk);
 	}
 	
 // Cleanup for program exit ------------------------------------------------------------------------
@@ -479,15 +536,13 @@ ort_env_fail:
 	ort->ReleaseEnv(env);
     printf("Released all ORT bindings.\n");
 
-    //printf("Cleaning up Python.\n");
-    //Py_DECREF(pTranscribeFunc);
-    //Py_DECREF(pModule);
-    //Py_Finalize();
-    //printf("Released Python.\n");
+sherpa_denoiser_fail:
+    SherpaOnnxDestroyOnlineSpeechDenoiser(sd);
 
-    SherpaOnnxDestroyDisplay(display);
-    SherpaOnnxDestroyOnlineStream(sherpa_stream);
+sherpa_recognizer_fail:
     SherpaOnnxDestroyOnlineRecognizer(sherpa_recognizer);
+    SherpaOnnxDestroyOnlineStream(sherpa_stream);
+    SherpaOnnxDestroyDisplay(display);
     
     printf("Exiting program.\n");
 	return 0;
