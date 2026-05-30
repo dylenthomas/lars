@@ -1,7 +1,0 @@
-To combine microphones try using Delay-Sum Beamforming: http://www.labbookpages.co.uk/audio/beamforming/delaySum.html
-
-To get the delay use the cross correlation: https://en.wikipedia.org/wiki/Cross-correlation, or:
-  In signal processing, cross-correlation is a measure of similarity of two series 
-  as a function of the displacement of one relative to the other.
-
-Then once the delay between microphone signals is found, sum them together and we have the single microphone singal.

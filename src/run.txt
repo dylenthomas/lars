@@ -1,1 +1,0 @@
-./main /home/dylenthomas/LiveASRonRPi-4/.model/silero_vad_16k_op15.onnx plughw:CARD=Snowball,DEV=0 plughw:CARD=Snowball_1,DEV=0

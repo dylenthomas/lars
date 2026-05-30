@@ -2,16 +2,16 @@ import numpy as np # pyright: ignore[reportMissingImports]
 import torch # pyright: ignore[reportMissingImports]
 from typing import List
 
-from python_utils.faster_whisper import WhisperModel
-from python_utils.ML_utils import offlineWhisperProcessor
+from OldPythonCode.python_utils.faster_whisper import WhisperModel
+from OldPythonCode.python_utils.ML_utils import offlineWhisperProcessor
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Using device: {}".format(device))
 
 print("Starting Whisper processor...")
-processor = offlineWhisperProcessor(config_path="/home/dylenthomas/LiveASRonRPi-4/src/python_utils/configs/preprocessor_config.json",
-                                    special_tokens_path="/home/dylenthomas/LiveASRonRPi-4/src/python_utils/configs/tokenizer_config.json",
-                                    vocab_path="/home/dylenthomas/LiveASRonRPi-4/src/python_utils/configs/vocab.json", 
+processor = offlineWhisperProcessor(config_path="/OldPythonCode/python_utils/configs/preprocessor_config.json",
+                                    special_tokens_path="/OldPythonCode/python_utils/configs/tokenizer_config.json",
+                                    vocab_path="/OldPythonCode/python_utils/configs/vocab.json",
                                     device=device
                                     )
 print("Starting Whisper...")

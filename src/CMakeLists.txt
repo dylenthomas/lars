@@ -1,78 +1,34 @@
-cmake_minimum_required(VERSION 3.28)
-set(CMAKE_CUDA_ARCHITECTURES "native")
-project(LARS LANGUAGES C CUDA)
-
-set(PROJECT_SOURCE "/home/dylenthomas/LiveASRonRPi-4")
-set(LIBS "${PROJECT_SOURCE}/libs")
-set(ORT_LIB_DIR "${LIBS}/onnxruntime")
-set(SHERPA_LIB_DIR "${LIBS}/sherpa-onnx")
-#set(VENV_DIR ${CMAKE_BINARY_DIR}/venv)
-
-find_package(CUDAToolkit REQUIRED)
-
-#find_package(Python3 3.14 EXACT REQUIRED COMPONENTS Interpreter)
-
-#if(NOT EXISTS ${VENV_DIR})
-#   message(STATUS "Creating virtual environment as ${VENV_DIR}...")
-#   execute_process(
-#       COMMAND ${Python3_EXECUTABLE} -m venv ${VENV_DIR}
-#       RESULT_VARIABLE VENV_RESULT
-#   )
-#   if(NOT VENV_RESULT EQUAL 0)
-#        message(FATAL_ERROR "Failed to create virtual environment")
-#    endif()
-#endif()
-
-#message(STATUS "Installing Python dependencies...")
-#execute_process(
-#    COMMAND ${VENV_DIR}/bin/pip install numpy torch av ctranslate2 tokenizers torchaudio
-#    RESULT_VARIABLE PIP_RESULT
-#)
-#if(NOT PIP_RESULT EQUAL 0)
-#    message(FATAL_ERROR "Failed to install Python dependencies!")
-#endif()
-
-#set(Python3_ROOT_DIR ${VENV_DIR})
-#set(Python3_EXECUTABLE ${VENV_DIR}/bin/python3)
-
-#find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
-
-#message(STATUS "Using Python: ${Python3_EXECUTABLE}")
-
-find_library(ORT_LIB onnxruntime PATHS ${ORT_LIB_DIR} NO_DEFAULT_PATH REQUIRED)
-find_library(MIC_LIB mic_access PATHS ${LIBS} NO_DEFAULT_PATH REQUIRED)
-find_library(FFT_LIB fft PATHS ${LIBS} NO_DEFAULT_PATH REQUIRED)
-find_library(ALSA_LIB asound REQUIRED)
-find_library(CNFG_PARSR config_parser PATHS ${LIBS} NO_DEFAULT_PATH REQUIRED)
-find_library(SHERPA_LIB sherpa-onnx-c-api PATHS ${SHERPA_LIB_DIR} NO_DEFAULT_PATH REQUIRED)
-
-add_executable(main main.c)
-
-target_include_directories(main PRIVATE
-    "${PROJECT_SOURCE}/include"
-    "${PROJECT_SOURCE}/include/onnxruntime"
-    "${PROJECT_SOURCE}/include/sherpa-onnx"
-    #${Python3_INCLUDE_DIRS}
+add_library(lars_core STATIC
+        config_parser.c
+        fft.c
+        mic_access.c
 )
 
-target_link_libraries(main PRIVATE
-    ${ORT_LIB}
-    ${ALSA_LIB}
-    ${MIC_LIB}
-    ${FFT_LIB}
-    ${TRANSC_LIB}
-    ${CNFG_PARSR}
-    ${SHERPA_LIB}
-    #${Python3_LIBRARIES}
-    m
-    CUDA::cudart
-    CUDA::cublas
+target_include_directories(lars_core PUBLIC
+        "${CMAKE_SOURCE_DIR}/include"
+        "${CMAKE_SOURCE_DIR}/include/onnxruntime"
+        "${CMAKE_SOURCE_DIR}/include/sherpa-onnx"
 )
 
-set_target_properties(main PROPERTIES 
-    SKIP_BUILD_RPATH FALSE
-    BUILD_WITH_INSTALL_RPATH TRUE
-    INSTALL_RPATH "${ORT_LIB_DIR}"
-    INSTALL_RPATH "${SHERPA_LIB_DIR}"
-    INSTALL_RPATH_USE_LINK_PATH TRUE
+target_link_libraries(lars_core PUBLIC
+        ${ORT_LIB}
+        ${ALSA_LIB}
+        ${MIC_LIB}
+        ${FFT_LIB}
+        ${TRANSC_LIB}
+        ${CNFG_PARSR}
+        ${SHERPA_LIB}
+        m
+        CUDA::cudart
+        CUDA::cublas
+)
+
+add_executable(lars main.c)
+target_link_libraries(lars PRIVATE lars_core)
+
+set_target_properties(lars PROPERTIES
+        SKIP_BUILD_RPATH FALSE
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH_USE_LINK_PATH TRUE
+        INSTALL_RPATH "${ORT_LIB_DIR};${SHERPA_LIB_DIR}"
 )

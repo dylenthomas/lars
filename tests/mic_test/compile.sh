@@ -1,6 +1,6 @@
 #!/bin/bash
 
-PROJECT_ROOT="/home/dylenthomas/Calliope/LARS/LiveASRonRPi-4"
+PROJECT_ROOT="/home/dylenthomas/LiveASRonRPi-4"
 OUT_NAME="test"
 
 gcc -Wall mic_test.c \
@@ -12,4 +12,4 @@ gcc -Wall mic_test.c \
 echo "env vars:"
 echo "export LD_LIBRARY_PATH="$PROJECT_ROOT/libs""
 echo ""
-echo "run command: ./$OUT_NAME plughw:CARD=Generic_1,DEV=0"
+echo "run command: ./$OUT_NAME plughw:CARD=Snowball,DEV=0"
