@@ -9,7 +9,6 @@
 #include "onnxruntime_c_api.h"
 #include "mic_access.h"
 #include "config_parser.h"
-#include "fft.h"
 #include "sherpa-onnx/c-api/c-api.h"
 
 #define KEYWORD_CONF "configs/keywords.json"
@@ -27,7 +26,38 @@
 #define DEVICE_ID 0
 #define GPU_ALIGNMENT 0
 
-#define NUM_THREADS 2
+#define NUM_THREADS 3
+
+#define TAIL_PADDING_LENGTH 8000
+
+static OrtEnv* ort_env = NULL;
+static OrtSessionOptions* ort_session_opts = NULL;
+static OrtCUDAProviderOptionsV2* ort_cuda_opts = NULL;
+static OrtSession* ort_session = NULL;
+static OrtRunOptions* ort_run_opts = NULL;
+static OrtMemoryInfo* ort_gpu_mem_info = NULL;
+static OrtMemoryInfo* ort_cpu_mem_info = NULL;
+static OrtAllocator* ort_alloc = NULL;
+static OrtIoBinding* ort_io_binding = NULL;
+
+static const int64_t sample_rate[] = {SAMPLE_RATE};
+static const int64_t sample_rate_shape[] = {1};
+static const int64_t input_data_shape[] = {1, MIC_BUFFER_LEN}; // input data will be the mic buffer
+static const int64_t state_data_shape[] = {2, 1, 128};
+static float initial_state[STATE_LEN] = {0};
+
+static float combined_buffer[MIC_BUFFER_LEN] = {0};
+static OrtValue* vad_input_tensor = NULL;
+static OrtValue* vad_state_tensor = NULL;
+static OrtValue* vad_sr_tensor = NULL;
+
+static const char* encoder_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/sherpa-onnx-streaming-zipformer-en-2023-06-21/encoder-epoch-99-avg-1.onnx";
+static const char* decoder_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/sherpa-onnx-streaming-zipformer-en-2023-06-21/decoder-epoch-99-avg-1.onnx";
+static const char* joiner_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/sherpa-onnx-streaming-zipformer-en-2023-06-21/joiner-epoch-99-avg-1.onnx";
+static const char* tokens_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/sherpa-onnx-streaming-zipformer-en-2023-06-21/tokens.txt";
+static const char* vad_model_path = "/home/dylenthomas/LiveASRonRPi-4/.models/silero_vad_16k_op15.onnx";
+static const char* mic1_name = "plughw:CARD=Snowball,DEV=0";
+static const char* mic2_name = "plughw:CARD=Snowball_1,DEV=0";
 
 static volatile int keep_running = 1;
 void intHandler(int dummy) {
@@ -41,12 +71,21 @@ struct mic_thread_data {
     pthread_mutex_t* mutex;
 };
 
-static atomic_int run_mic_threads = 0;
+struct transcribe_thread_data {
+    const SherpaOnnxOnlineRecognizer* recognizer;
+    const SherpaOnnxOnlineStream* stream;
+    const SherpaOnnxOnlineSpeechDenoiser* denoiser;
 
-static const char* encoder_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/encoder-epoch-99-avg-1.onnx";
-static const char* decoder_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/decoder-epoch-99-avg-1.onnx";
-static const char* joiner_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/joiner-epoch-99-avg-1.onnx";
-static const char* tokens_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/tokens.txt";
+    int ready;
+    float audio[MIC_BUFFER_LEN];
+    int flush;
+    float chance_of_speech;
+
+    pthread_mutex_t* mutex;
+    pthread_cond_t* cond;
+};
+
+static atomic_int run_mic_threads = 0;
 
 static int badStatus(OrtStatus* status, const OrtApi* ort) {
 	// Make sure the API was accessed correctly 
@@ -59,17 +98,86 @@ static int badStatus(OrtStatus* status, const OrtApi* ort) {
 	return 0;
 }
 
-static float getSpeechProb(
-        OrtValue*** outputs,
-        size_t output_count,
-		const OrtApi* ort,
-		OrtSession* session,
-		OrtRunOptions* run_opts,
-        OrtIoBinding* io_binding,
-        OrtAllocator* alloc
-		) {
-    if (badStatus(ort->RunWithBinding(session, run_opts, io_binding), ort)) { return -1.0f; }
-    if (badStatus(ort->GetBoundOutputValues(io_binding, alloc, outputs, &output_count), ort)) { return -1.0f; }
+static const OrtApi* initializeORT() {
+    printf("Initializing ORT...\n");
+	const OrtApi* ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+	if (ort == NULL) { fprintf(stderr, "ORT api returned nullptr!\n"); return NULL; }
+
+	if (badStatus(ort->CreateEnv(ORT_LOGGING_LEVEL_VERBOSE, "onnxruntime", &ort_env), ort)) { goto ort_env_fail; }
+
+	if (badStatus(ort->CreateSessionOptions(&ort_session_opts), ort)) { goto ort_session_opts_fail; }
+	if (badStatus(ort->SetIntraOpNumThreads(ort_session_opts, 1), ort)) { goto ort_session_opts_fail; }
+	if (badStatus(ort->SetInterOpNumThreads(ort_session_opts, 1), ort)) { goto ort_session_opts_fail; }
+	if (badStatus(ort->SetSessionGraphOptimizationLevel(ort_session_opts, ORT_ENABLE_ALL), ort)) { goto ort_session_opts_fail; }
+
+    if (badStatus(ort->CreateCUDAProviderOptions(&ort_cuda_opts), ort)) { goto ort_cuda_opts_fail; }
+    if (badStatus(ort->SessionOptionsAppendExecutionProvider_CUDA_V2(ort_session_opts, ort_cuda_opts), ort)) { goto ort_cuda_opts_fail; }
+
+	if (badStatus(ort->CreateSession(ort_env, vad_model_path, ort_session_opts, &ort_session), ort)) { goto ort_session_fail; }
+
+	if (badStatus(ort->CreateRunOptions(&ort_run_opts), ort)) { goto ort_session_fail; }
+
+    if (badStatus(ort->CreateMemoryInfo_V2("Cuda", OrtMemoryInfoDeviceType_GPU,
+        VENDOR_ID, DEVICE_ID, OrtMemTypeDefault, GPU_ALIGNMENT,
+        OrtDeviceAllocator, &ort_gpu_mem_info), ort)) { goto ort_gpu_mem_info_fail; }
+
+	if (badStatus(ort->CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault,
+	    &ort_cpu_mem_info), ort)) { goto ort_cpu_mem_info_fail; }
+
+	if (badStatus(ort->GetAllocatorWithDefaultOptions(&ort_alloc), ort)) { goto ort_cpu_mem_info_fail; }
+
+	if (badStatus(ort->CreateTensorWithDataAsOrtValue(
+		ort_gpu_mem_info, sample_rate, sizeof(sample_rate), sample_rate_shape, SAMPLE_RATE_DIMS,
+		ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &vad_sr_tensor), ort)) { goto ort_sr_tensor_fail; }
+
+	// create initializing state for model of all zeros
+	if (badStatus(ort->CreateTensorWithDataAsOrtValue(
+		ort_gpu_mem_info, initial_state, sizeof(initial_state), state_data_shape, STATE_DIMS,
+		ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &vad_state_tensor), ort)) { goto ort_state_tensor_fail; }
+
+	if (badStatus(ort->CreateTensorWithDataAsOrtValue(
+		ort_gpu_mem_info, combined_buffer, sizeof(combined_buffer), input_data_shape, INPUT_DIMS,
+		ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &vad_input_tensor), ort)) { goto ort_input_tensor_fail; }
+
+    if (badStatus(ort->CreateIoBinding(ort_session, &ort_io_binding), ort)) { goto ort_io_binding_fail; }
+
+    if (badStatus(ort->BindInput(ort_io_binding, "input", vad_input_tensor), ort)) { goto ort_io_binding_fail; }
+    if (badStatus(ort->BindInput(ort_io_binding, "state", vad_state_tensor), ort)) { goto ort_io_binding_fail; }
+    if (badStatus(ort->BindInput(ort_io_binding, "sr", vad_sr_tensor), ort)) { goto ort_io_binding_fail; }
+    if (badStatus(ort->BindOutputToDevice(ort_io_binding, "output", ort_cpu_mem_info), ort)) { goto ort_io_binding_fail; }
+    if (badStatus(ort->BindOutputToDevice(ort_io_binding, "stateN", ort_cpu_mem_info), ort)) { goto ort_io_binding_fail; }
+
+    return ort;
+
+    ort_io_binding_fail:
+        ort->ReleaseIoBinding(ort_io_binding);
+    ort_input_tensor_fail:
+        ort->ReleaseValue(vad_input_tensor);
+    ort_state_tensor_fail:
+        ort->ReleaseValue(vad_state_tensor);
+    ort_sr_tensor_fail:
+        ort->ReleaseValue(vad_sr_tensor);
+    ort_cpu_mem_info_fail:
+        ort->ReleaseMemoryInfo(ort_cpu_mem_info);
+    ort_gpu_mem_info_fail:
+        ort->ReleaseMemoryInfo(ort_gpu_mem_info);
+    ort_session_fail:
+        ort->ReleaseSession(ort_session);
+    ort_cuda_opts_fail:
+        ort->ReleaseCUDAProviderOptions(ort_cuda_opts);
+    ort_session_opts_fail:
+        ort->ReleaseSessionOptions(ort_session_opts);
+    ort_env_fail:
+        ort->ReleaseEnv(ort_env);
+    printf("Released all ORT bindings.\n");
+
+    return NULL;
+}
+
+static float getSpeechProb(OrtValue*** outputs, const OrtApi* ort) {
+    size_t output_count = 2;
+    if (badStatus(ort->RunWithBinding(ort_session, ort_run_opts, ort_io_binding), ort)) { return -2.0f; }
+    if (badStatus(ort->GetBoundOutputValues(ort_io_binding, ort_alloc, outputs, &output_count), ort)) { return -2.0f; }
 	
 	// Retrieve probability of speech from the model
 	OrtValue* ort_speech_prob = (*outputs)[0];
@@ -85,7 +193,7 @@ static void* readMicData(void* ptr) {
     while (run_mic_threads) {
         int16_t tmp_buffer[MIC_BUFFER_LEN] = {0};
 	    int i = 0;
-	
+
         read_mic(tmp_buffer, args->device, MIC_BUFFER_LEN);
         // convert int mic data to float	
         pthread_mutex_lock(args->mutex);
@@ -100,58 +208,73 @@ static void* readMicData(void* ptr) {
     return NULL;
 }
 
-static int findSampleDelay(const float* ref_buffer, const float* other_buffer)  {
-    // Find sample delay using frequency domain formula
-    int i = 0;
-    int m_delay = 0;
+static void* transcribe(void* ptr) {
+    struct transcribe_thread_data* args = ptr;
+    const SherpaOnnxOnlineRecognizer* recognizer = args->recognizer;
+    const SherpaOnnxOnlineStream* stream = args->stream;
+    const SherpaOnnxOnlineSpeechDenoiser* denoiser = args->denoiser;
 
-    complex x[MIC_BUFFER_LEN], y[MIC_BUFFER_LEN], tmp[MIC_BUFFER_LEN], Rxy[MIC_BUFFER_LEN];
+    while (keep_running) {
+        float audio[MIC_BUFFER_LEN] = {0};
+        int flush = 0;
+        float chance_of_speech = 0.0;
 
-    while (i < MIC_BUFFER_LEN) {
-        x[i].Re = ref_buffer[i];
-        x[i].Im = 0.0f;
-        y[i].Re = other_buffer[i];
-        y[i].Im = 0.0f;
+        pthread_mutex_lock(args->mutex);
+        while (!args->ready) {
+            pthread_cond_wait(args->cond, args->mutex); // sleep until main thread requests prediction
+        }
+        args->ready = 0;
+        memcpy(audio, args->audio, MIC_BUFFER_LEN * sizeof(float));
+        flush = args->flush;
+        chance_of_speech = args->chance_of_speech;
+        pthread_mutex_unlock(args->mutex);
 
-        i++;
+        if (!flush) {
+            const SherpaOnnxDenoisedAudio* chunk = SherpaOnnxOnlineSpeechDenoiserRun(denoiser, audio, MIC_BUFFER_LEN, SAMPLE_RATE);
+
+            if (chunk->sample_rate <= 48000 && chunk != NULL) {
+                //SherpaOnnxOnlineStreamAcceptWaveform(stream, SAMPLE_RATE, audio, MIC_BUFFER_LEN);
+                SherpaOnnxOnlineStreamAcceptWaveform(stream, chunk->sample_rate, chunk->samples, chunk->n);
+                while (SherpaOnnxIsOnlineStreamReady(recognizer, stream)) {
+                    SherpaOnnxDecodeOnlineStream(recognizer, stream);
+                }
+
+                const SherpaOnnxOnlineRecognizerResult* r = SherpaOnnxGetOnlineStreamResult(recognizer, stream);
+                printf("\033[1A");
+                printf("\033[2K\r[%.2f] %s    \n", chance_of_speech, r->text);
+                fflush(stdout);
+
+                if (SherpaOnnxOnlineStreamIsEndpoint(recognizer, stream)) {
+                    SherpaOnnxOnlineStreamReset(recognizer, stream);
+                }
+
+                SherpaOnnxDestroyOnlineRecognizerResult(r);
+            }
+            SherpaOnnxDestroyDenoisedAudio(chunk);
+        } else {
+            const SherpaOnnxDenoisedAudio* tail = SherpaOnnxOnlineSpeechDenoiserFlush(denoiser);
+            const float tail_padding[TAIL_PADDING_LENGTH] = {0};
+
+            if (tail) { SherpaOnnxOnlineStreamAcceptWaveform(stream, SAMPLE_RATE, tail->samples, tail->n); }
+
+            SherpaOnnxOnlineStreamAcceptWaveform(stream, SAMPLE_RATE, tail_padding, TAIL_PADDING_LENGTH);
+            SherpaOnnxOnlineStreamInputFinished(stream);
+            while (SherpaOnnxIsOnlineStreamReady(recognizer, stream)) {
+                SherpaOnnxDecodeOnlineStream(recognizer, stream);
+            }
+
+            const SherpaOnnxOnlineRecognizerResult* r = SherpaOnnxGetOnlineStreamResult(recognizer, stream);
+            printf("\033[1A");
+            printf("\033[2K\r[%.2f] %s    \n", chance_of_speech, r->text);
+            fflush(stdout);
+
+            SherpaOnnxDestroyOnlineRecognizerResult(r);
+            SherpaOnnxOnlineStreamReset(recognizer, stream);
+            SherpaOnnxDestroyDenoisedAudio(tail);
+        }
     }
 
-    fft(x, MIC_BUFFER_LEN, tmp);
-    fft(y, MIC_BUFFER_LEN, tmp);
-
-    i = 0;
-    while (i < MIC_BUFFER_LEN) {
-        // compute correlation
-        // the total formula is the dot product between x and complex conjugate of y
-        //  normalized by the magnitude
-        float a = x[i].Re;
-        float b = x[i].Im;
-        float c = y[i].Re;
-        float d = y[i].Im;
-
-        const double m1 = pow((double)(a*c + b*d), 2);
-        const double m2 = pow((double)(b*c - a*d), 2);
-        const double mag = sqrt(m1 + m2);
-
-        Rxy[i].Re = (a*c + b*d)/mag;
-        Rxy[i].Im = (b*c - a*d)/mag;
-
-        i++;
-    }
-
-    ifft(Rxy, MIC_BUFFER_LEN, tmp);
-    // The index of the max value represents our delay
-    i = 0;
-    while (i < MIC_BUFFER_LEN) {
-        // compare absolute values
-        const float a = (Rxy[i].Re < 0.0) ? -Rxy[i].Re : Rxy[i].Re;
-        const float b = (Rxy[m_delay].Re < 0.0) ? -Rxy[m_delay].Re : Rxy[m_delay].Re;
-        m_delay = (a > b) ? i : m_delay;
-
-        i++;
-    }
-    
-    return (m_delay > MIC_BUFFER_LEN/2) ? m_delay - MIC_BUFFER_LEN : m_delay;
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -161,8 +284,8 @@ int main(int argc, char *argv[]) {
     SherpaOnnxOnlineRecognizerConfig recognizer_config;
     memset(&recognizer_config, 0, sizeof(recognizer_config));
     recognizer_config.decoding_method = "greedy_search";
-    recognizer_config.model_config.debug = 1;
-    recognizer_config.model_config.num_threads = 1;
+    recognizer_config.model_config.debug = 0;
+    recognizer_config.model_config.num_threads = 4;
     recognizer_config.model_config.provider = "cuda";
     recognizer_config.model_config.tokens = tokens_filename;
     recognizer_config.model_config.transducer.encoder = encoder_filename;
@@ -172,8 +295,8 @@ int main(int argc, char *argv[]) {
 
     SherpaOnnxOnlineSpeechDenoiserConfig denoiser_config;
     memset(&denoiser_config, 0, sizeof(denoiser_config));
-    denoiser_config.model.dpdfnet.model = "/home/dylenthomas/LiveASRonRPi-4/.models/dpdfnet8.onnx";
-    denoiser_config.model.num_threads = 1;
+    denoiser_config.model.dpdfnet.model = "/home/dylenthomas/LiveASRonRPi-4/.models/dpdfnet_baseline.onnx";
+    denoiser_config.model.num_threads = 2;
     denoiser_config.model.debug = 0;
     denoiser_config.model.provider = "cpu";
 
@@ -190,40 +313,27 @@ int main(int argc, char *argv[]) {
         goto sherpa_denoiser_fail;
     }
 
-    const SherpaOnnxDisplay *display = SherpaOnnxCreateDisplay(50);
-    int32_t segment_id = 0;
+    struct transcribe_thread_data transcribe_data;
+    pthread_mutex_t transcribe_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t transcribe_cond = PTHREAD_COND_INITIALIZER;
 
-    if (argc != 4) { printf("Args should be: VAD Model Path, Mic1 Name, Mic2 Name\n"); return 0; }
-	const char* vad_model_path = argv[1];
-	const char* mic1_name = argv[2];
-    const char* mic2_name = argv[3];
+    transcribe_data.recognizer = sherpa_recognizer;
+    transcribe_data.stream = sherpa_stream;
+    transcribe_data.denoiser = sd;
+    transcribe_data.cond = &transcribe_cond;
+    transcribe_data.mutex = &transcribe_mutex;
+    transcribe_data.ready = 0;
 
     //struct keywordHM keywords = createKeywordHM(KEYWORD_CONF);
 
-    double peak_value = 0.0f;
+    double peak_value = 0.0;
     int iterations_held = 0;
     int iterations_decayed = 0;
-
-    int64_t sample_rate[] = {SAMPLE_RATE};
-	const int64_t sample_rate_shape[] = {1};
-
-	const int64_t input_data_shape[] = {1, MIC_BUFFER_LEN}; // input data will be the mic buffer
-	const int64_t state_data_shape[] = {2, 1, 128};	
 
     atomic_long updated1 = ATOMIC_VAR_INIT(0);
     atomic_long updated2 = ATOMIC_VAR_INIT(0);
     float mic1_buffer[MIC_BUFFER_LEN] = {0};
     float mic2_buffer[MIC_BUFFER_LEN] = {0};
-    float combined_buffer[MIC_BUFFER_LEN] = {0};
-    float long_buffer[SAMPLE_RATE * LONGEST_TRANSCRIPT] = {0};
-	float initial_state[STATE_LEN] = {0};
-
-    int long_buffer_size = 0;
-    int long_buffer_capacity = SAMPLE_RATE * LONGEST_TRANSCRIPT;
-
-	OrtValue* input_tensor = NULL;
-	OrtValue* state_tensor = NULL;
-	OrtValue* sr_tensor = NULL;
 
     int ret;
     long int mic1_last_updated;
@@ -231,60 +341,8 @@ int main(int argc, char *argv[]) {
 
     int vad_previously_triggered = 0;
 // Initialize the ORT Api --------------------------------------------------------------------------
-	printf("Initializing ORT...\n");
-	const OrtApi* ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-	if (ort == NULL) { fprintf(stderr, "ORT api returned nullptr!\n"); return 1; }
-
-	OrtEnv* env = NULL;
-	if (badStatus(ort->CreateEnv(ORT_LOGGING_LEVEL_VERBOSE, "onnxruntime", &env), ort)) { goto ort_env_fail; }
-
-	OrtSessionOptions* session_opts = NULL;
-	if (badStatus(ort->CreateSessionOptions(&session_opts), ort)) { goto ort_session_opts_fail; }
-	if (badStatus(ort->SetIntraOpNumThreads(session_opts, 1), ort)) { goto ort_session_opts_fail; }
-	if (badStatus(ort->SetInterOpNumThreads(session_opts, 1), ort)) { goto ort_session_opts_fail; }
-	if (badStatus(ort->SetSessionGraphOptimizationLevel(session_opts, ORT_ENABLE_ALL), ort)) { goto ort_session_opts_fail; }
-
-    OrtCUDAProviderOptionsV2* cuda_opts = NULL;
-    if (badStatus(ort->CreateCUDAProviderOptions(&cuda_opts), ort)) { goto ort_cuda_opts_fail; }
-    if (badStatus(ort->SessionOptionsAppendExecutionProvider_CUDA_V2(session_opts, cuda_opts), ort)) { goto ort_cuda_opts_fail; }
-
-	OrtSession* ort_session = NULL;
-	if (badStatus(ort->CreateSession(env, vad_model_path, session_opts, &ort_session), ort)) { goto ort_session_fail; }
-
-	OrtRunOptions* ort_run_opts = NULL;
-	if (badStatus(ort->CreateRunOptions(&ort_run_opts), ort)) { goto ort_session_fail; }
-
-    OrtMemoryInfo* gpu_mem_info = NULL;
-    if (badStatus(ort->CreateMemoryInfo_V2("Cuda", OrtMemoryInfoDeviceType_GPU, VENDOR_ID, DEVICE_ID,
-            OrtMemTypeDefault, GPU_ALIGNMENT, OrtDeviceAllocator, &gpu_mem_info), ort)) { goto ort_gpu_mem_info_fail; }
-
-	OrtMemoryInfo* cpu_mem_info = NULL;
-	if (badStatus(ort->CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault, &cpu_mem_info), ort)) { goto ort_cpu_mem_info_fail; }
-
-	OrtAllocator* alloc = NULL;
-	if (badStatus(ort->GetAllocatorWithDefaultOptions(&alloc), ort)) { goto ort_cpu_mem_info_fail; }
-	
-	if (badStatus(ort->CreateTensorWithDataAsOrtValue(
-		gpu_mem_info, sample_rate, sizeof(sample_rate), sample_rate_shape, SAMPLE_RATE_DIMS,
-		ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &sr_tensor), ort)) { goto ort_sr_tensor_fail; }
-
-	// create initializing state for model of all zeros 
-	if (badStatus(ort->CreateTensorWithDataAsOrtValue(
-		gpu_mem_info, initial_state, sizeof(initial_state), state_data_shape, STATE_DIMS,
-		ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &state_tensor), ort)) { goto ort_state_tensor_fail; }
-
-	if (badStatus(ort->CreateTensorWithDataAsOrtValue(
-		gpu_mem_info, combined_buffer, sizeof(combined_buffer), input_data_shape, INPUT_DIMS, 
-		ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor), ort)) { goto ort_input_tensor_fail; }
-
-    OrtIoBinding* io_binding = NULL;
-    if (badStatus(ort->CreateIoBinding(ort_session, &io_binding), ort)) { goto ort_io_binding_fail; }
-
-    if (badStatus(ort->BindInput(io_binding, "input", input_tensor), ort)) { goto ort_io_binding_fail; }
-    if (badStatus(ort->BindInput(io_binding, "state", state_tensor), ort)) { goto ort_io_binding_fail; }
-    if (badStatus(ort->BindInput(io_binding, "sr", sr_tensor), ort)) { goto ort_io_binding_fail; }
-    if (badStatus(ort->BindOutputToDevice(io_binding, "output", cpu_mem_info), ort)) { goto ort_io_binding_fail; }
-    if (badStatus(ort->BindOutputToDevice(io_binding, "stateN", cpu_mem_info), ort)) { goto ort_io_binding_fail; }
+    const OrtApi* ort = initializeORT();
+    if (ort == NULL) { goto ort_initialize_fail; }
 // Initialize Microphone ---------------------------------------------------------------------------
 	printf("Initializing microphones...\n");
 
@@ -325,14 +383,17 @@ int main(int argc, char *argv[]) {
     }
     printf("Started mic2 thread.\n");
 
+    if ((ret = pthread_create(&thread[2], NULL, transcribe, &transcribe_data)) != 0) {
+        fprintf(stderr, "Error: failed to create transcribe thread %d", ret);
+        goto second_mic_thread_fail;
+    }
+
     mic1_last_updated = *mic_data[0].updated;
     mic2_last_updated = *mic_data[1].updated;
 // -------------------------------------------------------------------------------------------------
     while (keep_running) {
         int hold_iterations = 5;
-
         const double speech_threshold = 0.7; // trigger threshold to start transcription
-        size_t num_outputs = 2;
 
         // wait until both buffers are populated
         if (mic1_last_updated == *mic_data[0].updated) { continue; }
@@ -341,50 +402,15 @@ int main(int argc, char *argv[]) {
         if (mic2_last_updated == *mic_data[1].updated) { continue; }
         mic2_last_updated = *mic_data[1].updated;
 
-        // get the delay of mic2 relative to mic1
         pthread_mutex_lock(mic_data[0].mutex);
         pthread_mutex_lock(mic_data[1].mutex);
 
-        int delay = findSampleDelay(mic_data[0].buffer, mic_data[1].buffer);
-
-        /*
-        // Audio reached mic 2 first
-        if (delay < 0) {
-            memcpy(combined_buffer, mic_data[1].buffer, MIC_BUFFER_LEN * sizeof(float));
-        }
-        // Audio reached mic 1 first
-        else {
-            memcpy(combined_buffer, mic_data[0].buffer, MIC_BUFFER_LEN * sizeof(float));
-        }
-        */
-
-        complex X[MIC_BUFFER_LEN], Y[MIC_BUFFER_LEN], combined[MIC_BUFFER_LEN], tmp[MIC_BUFFER_LEN];
-
+        float rms1 = 0, rms2 = 0;
         for (int i = 0; i < MIC_BUFFER_LEN; i++) {
-            X[i].Re = mic_data[0].buffer[i]; X[i].Im = 0.0f;
-            Y[i].Re = mic_data[1].buffer[i]; Y[i].Im = 0.0f;
+            rms1 += mic_data[0].buffer[i] * mic_data[0].buffer[i];
+            rms2 += mic_data[1].buffer[i] * mic_data[1].buffer[i];
         }
-
-        fft(X, MIC_BUFFER_LEN, tmp);
-        fft(Y, MIC_BUFFER_LEN, tmp);
-
-        for (int f = 0; f < MIC_BUFFER_LEN; f++){
-            double shift_angle = -2 * PI * f * delay/MIC_BUFFER_LEN;
-            complex Y_shifted;
-
-            Y_shifted.Re = Y[f].Re * cos(shift_angle) - Y[f].Im * sin(shift_angle);
-            Y_shifted.Im = Y[f].Re * sin(shift_angle) + Y[f].Im * cos(shift_angle);
-
-            combined[f].Re = (X[f].Re + Y_shifted.Re) * 0.5f;
-            combined[f].Im = (X[f].Im + Y_shifted.Im) * 0.5f;
-        }
-
-        ifft(combined, MIC_BUFFER_LEN, tmp);
-        memset(combined_buffer, 0, sizeof(combined_buffer));
-
-        for (int i = 0; i < MIC_BUFFER_LEN; i++) {
-            combined_buffer[i] = combined[i].Re / MIC_BUFFER_LEN;
-        }
+        memcpy(combined_buffer, rms1 > rms2 ? mic_data[0].buffer : mic_data[1].buffer, MIC_BUFFER_LEN * sizeof(float));
 
         pthread_mutex_unlock(mic_data[0].mutex);
         pthread_mutex_unlock(mic_data[1].mutex);
@@ -392,8 +418,9 @@ int main(int argc, char *argv[]) {
 		float speech_prob;
         OrtValue** outputs = NULL;
 
-		speech_prob = getSpeechProb(&outputs, num_outputs, ort, ort_session, ort_run_opts, io_binding, alloc);
-        if (speech_prob == -1.0f) { goto end_loop; } // if VAD failed just skip the iteration 
+		speech_prob = getSpeechProb(&outputs, ort);
+        if (speech_prob == -2.0f) { continue; }
+        if (speech_prob == -1.0f) { goto end_of_loop;; }
         
         if (speech_prob > peak_value) { // increase
             peak_value = speech_prob;
@@ -408,84 +435,37 @@ int main(int argc, char *argv[]) {
             peak_value *= exp(-1 * decay_rate * iterations_decayed);
             iterations_decayed++;
         }
-        
-        printf("%.2f\n", peak_value);
 
         if (peak_value >= speech_threshold) {
-            const SherpaOnnxDenoisedAudio* chunk = SherpaOnnxOnlineSpeechDenoiserRun(sd, combined_buffer, MIC_BUFFER_LEN, SAMPLE_RATE);
-            if (chunk && chunk->sample_rate == SAMPLE_RATE) {
-                SherpaOnnxOnlineStreamAcceptWaveform(sherpa_stream, chunk->sample_rate, chunk->samples, chunk->n);
-                while (SherpaOnnxIsOnlineStreamReady(sherpa_recognizer, sherpa_stream)) {
-                    SherpaOnnxDecodeOnlineStream(sherpa_recognizer, sherpa_stream);
-                }
+            pthread_mutex_lock(transcribe_data.mutex);
 
-                const SherpaOnnxOnlineRecognizerResult* r = SherpaOnnxGetOnlineStreamResult(sherpa_recognizer, sherpa_stream);
-                if (strlen(r->text)) { printf("%s\n", r->text); }
+            transcribe_data.ready = 1;
+            transcribe_data.flush = 0;
+            transcribe_data.chance_of_speech = (float)peak_value;
+            memcpy(transcribe_data.audio, combined_buffer, MIC_BUFFER_LEN * sizeof(float));
+            pthread_cond_signal(transcribe_data.cond);
 
-                if (SherpaOnnxOnlineStreamIsEndpoint(sherpa_recognizer, sherpa_stream)) {
-                    if (strlen(r->text)) { ++segment_id; }
-                    SherpaOnnxOnlineStreamReset(sherpa_recognizer, sherpa_stream);
-                }
-                SherpaOnnxDestroyOnlineRecognizerResult(r);
+            pthread_mutex_unlock(transcribe_data.mutex);
+            vad_previously_triggered = 1;
+        } else if (vad_previously_triggered) {
+            pthread_mutex_lock(transcribe_data.mutex);
 
-                /*
-                if (long_buffer_size >= long_buffer_capacity) {
-                    printf("Reached capacity\n");
-                    SherpaOnnxWriteWave(long_buffer, long_buffer_size, chunk->sample_rate, "/home/dylenthomas/LiveASRonRPi-4/wavs/transcript.wav");
-                    long_buffer_size = 0;
-                    peak_value = 0.0;
-                }
-                */
+            transcribe_data.ready = 1;
+            transcribe_data.flush = 1;
+            transcribe_data.chance_of_speech = (float)peak_value;
+            pthread_cond_signal(transcribe_data.cond);
 
-                SherpaOnnxDestroyDenoisedAudio(chunk);
-                vad_previously_triggered = 1;
-            }
-        }
-        else if (vad_previously_triggered) {
-            const SherpaOnnxDenoisedAudio* tail = SherpaOnnxOnlineSpeechDenoiserFlush(sd);
-            if (tail) {
-                /*
-                int samples_to_copy = tail->n;
-                if (long_buffer_size + samples_to_copy > long_buffer_capacity) {
-                    samples_to_copy = long_buffer_capacity - long_buffer_size;
-                }
-                memcpy(long_buffer + long_buffer_size, tail->samples, samples_to_copy * sizeof(float));
-                long_buffer_size += samples_to_copy;
-                */
-
-                SherpaOnnxOnlineStreamAcceptWaveform(sherpa_stream, SAMPLE_RATE, tail->samples, tail->n);
-                SherpaOnnxDestroyDenoisedAudio(tail);
-            }
-
-            //printf("Reached end of speech and logged audio\n");
-            //SherpaOnnxWriteWave(long_buffer, long_buffer_size, SAMPLE_RATE, "/home/dylenthomas/LiveASRonRPi-4/wavs/transcript.wav");
-
-            const int padding_length = 8000;
-            const float tail_padding[padding_length] = {0};
-            SherpaOnnxOnlineStreamAcceptWaveform(sherpa_stream, SAMPLE_RATE, tail_padding, padding_length);
-            SherpaOnnxOnlineStreamInputFinished(sherpa_stream);
-            while (SherpaOnnxIsOnlineStreamReady(sherpa_recognizer, sherpa_stream)) {
-                SherpaOnnxDecodeOnlineStream(sherpa_recognizer, sherpa_stream);
-            }
-
-            const SherpaOnnxOnlineRecognizerResult* r = SherpaOnnxGetOnlineStreamResult(sherpa_recognizer, sherpa_stream);
-            if (strlen(r->text)) { printf("%s\n", r->text); }
-
+            pthread_mutex_unlock(transcribe_data.mutex);
             vad_previously_triggered = 0;
-            long_buffer_size = 0;
-            segment_id = 0;
             peak_value = 0.0;
-            SherpaOnnxDestroyOnlineRecognizerResult(r);
-            SherpaOnnxOnlineStreamReset(sherpa_recognizer, sherpa_stream);
         }
         
         // Cleanup iteration
-end_loop:
+end_of_loop:
         ort->ReleaseValue(outputs[0]);
-        ort->ReleaseValue(state_tensor);
-        state_tensor = outputs[1];
+        ort->ReleaseValue(vad_state_tensor);
+        vad_state_tensor = outputs[1];
         outputs[1] = NULL;
-        if (badStatus(ort->BindInput(io_binding, "state", state_tensor), ort)) { goto ort_io_binding_fail; }
 	}
 	
 // Cleanup for program exit ------------------------------------------------------------------------
@@ -504,36 +484,26 @@ first_mic_thread_fail:
     keep_running = 0;
 
     printf("Cleaning up ORT.\n");
-ort_io_binding_fail:
-    ort->ReleaseIoBinding(io_binding);
-ort_input_tensor_fail:
-    ort->ReleaseValue(input_tensor);
-ort_state_tensor_fail:
-    ort->ReleaseValue(state_tensor);
-ort_sr_tensor_fail:
-    ort->ReleaseValue(sr_tensor);
-ort_cpu_mem_info_fail:
-	ort->ReleaseMemoryInfo(cpu_mem_info);
-ort_gpu_mem_info_fail:
-    ort->ReleaseMemoryInfo(gpu_mem_info);
-ort_session_fail:
+    ort->ReleaseIoBinding(ort_io_binding);
+    ort->ReleaseValue(vad_input_tensor);
+    ort->ReleaseValue(vad_state_tensor);
+    ort->ReleaseValue(vad_sr_tensor);
+	ort->ReleaseMemoryInfo(ort_cpu_mem_info);
+    ort->ReleaseMemoryInfo(ort_gpu_mem_info);
 	ort->ReleaseSession(ort_session);
-ort_cuda_opts_fail:
-    ort->ReleaseCUDAProviderOptions(cuda_opts);
-ort_session_opts_fail:
-	ort->ReleaseSessionOptions(session_opts);
-ort_env_fail:
-	ort->ReleaseEnv(env);
+    ort->ReleaseCUDAProviderOptions(ort_cuda_opts);
+	ort->ReleaseSessionOptions(ort_session_opts);
+	ort->ReleaseEnv(ort_env);
     printf("Released all ORT bindings.\n");
 
+ort_initialize_fail:
 sherpa_denoiser_fail:
     SherpaOnnxDestroyOnlineSpeechDenoiser(sd);
 
 sherpa_recognizer_fail:
     SherpaOnnxDestroyOnlineRecognizer(sherpa_recognizer);
     SherpaOnnxDestroyOnlineStream(sherpa_stream);
-    SherpaOnnxDestroyDisplay(display);
-    
+
     printf("Exiting program.\n");
 	return 0;
 }

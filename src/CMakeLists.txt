@@ -23,7 +23,8 @@ target_link_libraries(lars_core PUBLIC
         CUDA::cublas
 )
 
-add_executable(lars main.c)
+add_executable(lars main.c
+)
 target_link_libraries(lars PRIVATE lars_core)
 
 set_target_properties(lars PROPERTIES
