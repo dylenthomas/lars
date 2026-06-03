@@ -11,9 +11,12 @@
 #include "config_parser.h"
 #include "sherpa-onnx/c-api/c-api.h"
 
+// Mic characteristics
 #define MIC_BUFFER_LEN 512
 #define SAMPLE_RATE 16000
 #define CHANNELS 1
+
+// VAD tensor dimensions
 #define STATE_LEN 2 * 1 * 128
 #define SAMPLE_RATE_DIMS 1
 #define INPUT_DIMS 2
@@ -25,6 +28,8 @@
 #define GPU_ALIGNMENT 0
 
 #define NUM_THREADS 3
+
+// Length of padding to add to the end of ASR
 #define TAIL_PADDING_LENGTH 8000
 
 // TODO: Make a Queue "class" so I can have a managed queue for transcription and other things

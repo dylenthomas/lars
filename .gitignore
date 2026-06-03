@@ -6,4 +6,4 @@ CMakeFiles/
 .vscode/
 cbuild/
 __pycache__/
-.models/
+.models/*
