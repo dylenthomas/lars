@@ -11,24 +11,25 @@
 #include "config_parser.h"
 #include "sherpa-onnx/c-api/c-api.h"
 
-#define KEYWORD_CONF "configs/keywords.json"
-#define MIC_BUFFER_LEN 512 
+#define MIC_BUFFER_LEN 512
 #define SAMPLE_RATE 16000
 #define CHANNELS 1
-#define LONGEST_TRANSCRIPT 30
-
 #define STATE_LEN 2 * 1 * 128
 #define SAMPLE_RATE_DIMS 1
 #define INPUT_DIMS 2
 #define STATE_DIMS 3
 
+// ORT Required GPU hardware information
 #define VENDOR_ID 4318
 #define DEVICE_ID 0
 #define GPU_ALIGNMENT 0
 
 #define NUM_THREADS 3
-
 #define TAIL_PADDING_LENGTH 8000
+
+// TODO: Make a Queue "class" so I can have a managed queue for transcription and other things
+// TODO: Replace atomic usages with mutexes
+// TODO: Improve in file documentation (add better comments)
 
 static OrtEnv* ort_env = NULL;
 static OrtSessionOptions* ort_session_opts = NULL;
@@ -200,7 +201,6 @@ static void* readMicData(void* ptr) {
 	    while (i < MIC_BUFFER_LEN) { args->buffer[i] = (float)tmp_buffer[i] / 32768.0f; i++; }
         pthread_mutex_unlock(args->mutex);
 
-        // TODO: Replace with mutex
         // avoid running prediction on old data
         atomic_store(args->updated, random());
     }

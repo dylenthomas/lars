@@ -1,1 +1,0 @@
-/usr/bin/cc CMakeFiles/test.dir/onnxrt_vad_gpu_test.c.o -o test   -L/home/dylenthomas/LiveASRonRPi-4/libs  -Wl,-rpath,/home/dylenthomas/LiveASRonRPi-4/libs/onnxruntime::/home/dylenthomas/LiveASRonRPi-4/libs/onnxruntime:/home/dylenthomas/LiveASRonRPi-4/libs /home/dylenthomas/LiveASRonRPi-4/libs/onnxruntime/libonnxruntime.so /usr/lib/x86_64-linux-gnu/libasound.so -lmic_access -lm 

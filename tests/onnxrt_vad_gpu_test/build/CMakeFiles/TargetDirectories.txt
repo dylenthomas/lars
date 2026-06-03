@@ -1,3 +1,0 @@
-/home/dylenthomas/LiveASRonRPi-4/tests/onnxrt_vad_gpu_test/build/CMakeFiles/test.dir
-/home/dylenthomas/LiveASRonRPi-4/tests/onnxrt_vad_gpu_test/build/CMakeFiles/edit_cache.dir
-/home/dylenthomas/LiveASRonRPi-4/tests/onnxrt_vad_gpu_test/build/CMakeFiles/rebuild_cache.dir

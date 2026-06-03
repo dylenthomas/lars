@@ -10,7 +10,7 @@
 
 #include "mic_access.h"
 #include "fft.h"
-#include "wav_writer.h"   // NEW: WAV recording
+#include "wav_writer.h"
 
 #define MIC_BUFFER_LEN 1024 
 #define SAMPLE_RATE 16000
