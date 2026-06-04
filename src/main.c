@@ -6,21 +6,25 @@
 #include <pthread.h>
 #include <time.h>
 #include <signal.h>
-#include <stdatomic.h>
 
 #include "onnxruntime_c_api.h"
 #include "mic_access.h"
 #include "sherpa-onnx/c-api/c-api.h"
 
-// TODO: Double check the current queue implementation
 // TODO: Setup unit tests for the queue
-// TODO: Replace atomic usages with mutexes
-// TODO: Improve in file documentation (add better comments)
+// TODO: Rethink the mic updated functionality
 
 void intHandler(int dummy) {
     keep_running = 0;
 }
 
+/**
+ * Check status of any ORT function
+ *
+ * @param status Status pointer returned by ORT functino
+ * @param ort ORT Api pointer
+ * @return good or bad status (1 = bad status and function failed, 0 = good status)
+ */
 static int badStatus(OrtStatus* status, const OrtApi* ort) {
 	// Make sure the API was accessed correctly 
 	if (status != NULL) {
@@ -32,6 +36,11 @@ static int badStatus(OrtStatus* status, const OrtApi* ort) {
 	return 0;
 }
 
+/**
+ * Initialize the ORT environment and necessary tensors
+ *
+ * @return ORT Api pointer
+ */
 static const OrtApi* initializeORT() {
     printf("Initializing ORT...\n");
 	const OrtApi* ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
@@ -108,6 +117,13 @@ static const OrtApi* initializeORT() {
     return NULL;
 }
 
+/**
+ * Get the speech probability form the VAD model outputs
+ *
+ * @param outputs Outputs from the VAD model
+ * @param ort ORT Api pointer
+ * @return probability of speech (if < 0.0f then something went wrong)
+ */
 static float getSpeechProb(OrtValue*** outputs, const OrtApi* ort) {
     size_t output_count = 2;
     if (badStatus(ort->RunWithBinding(ort_session, ort_run_opts, ort_io_binding), ort)) { return -2.0f; }
@@ -121,8 +137,14 @@ static float getSpeechProb(OrtValue*** outputs, const OrtApi* ort) {
     return prob_data[0];
 }
 
+/**
+ * Mic thread function that persistently runs throughout program life
+ *
+ * @param ptr thread struct containing all necessary information
+ * @return NULL
+ */
 static void* readMicData(void* ptr) {
-    const struct mic_thread_data* args = (struct mic_thread_data*)ptr;
+    struct mic_thread_data* args = (struct mic_thread_data*)ptr;
 
     while (run_mic_threads) {
         int16_t tmp_buffer[MIC_BUFFER_LEN] = {0};
@@ -132,15 +154,22 @@ static void* readMicData(void* ptr) {
         // convert int mic data to float	
         pthread_mutex_lock(args->mutex);
 	    while (i < MIC_BUFFER_LEN) { args->buffer[i] = (float)tmp_buffer[i] / 32768.0f; i++; }
-        pthread_mutex_unlock(args->mutex);
 
-        // avoid running prediction on old data
-        atomic_store(args->updated, random());
+        // avoid predicting on old values
+        long newUpdated = random();
+        args->updated = &newUpdated;
+        pthread_mutex_unlock(args->mutex);
     }
 
     return NULL;
 }
 
+/**
+ * Transcribe a given audio buffer into speech
+ *
+ * @param ptr thread struct containing all necessary information
+ * @return NULL
+ */
 static void* transcribe(void* ptr) {
     struct transcribe_thread_data* args = ptr;
     const SherpaOnnxOnlineRecognizer* recognizer = args->recognizer;
@@ -210,11 +239,8 @@ static void* transcribe(void* ptr) {
     return NULL;
 }
 
-int main(int argc, char *argv[]) {
-    signal(SIGINT, intHandler);
-    srandom(time(NULL));
-
-    SherpaOnnxOnlineRecognizerConfig recognizer_config;
+static int initializeSherpa() {
+    // Configure the ASR model
     memset(&recognizer_config, 0, sizeof(recognizer_config));
     recognizer_config.decoding_method = "greedy_search";
     recognizer_config.model_config.debug = 0;
@@ -226,30 +252,79 @@ int main(int argc, char *argv[]) {
     recognizer_config.model_config.transducer.joiner = joiner_filename;
     recognizer_config.enable_endpoint = 1;
 
-    SherpaOnnxOnlineSpeechDenoiserConfig denoiser_config;
+    sherpa_recognizer = SherpaOnnxCreateOnlineRecognizer(&recognizer_config);
+    if (sherpa_recognizer == NULL) {
+        fprintf(stderr, "Please check your config!\n");
+        SherpaOnnxDestroyOnlineRecognizer(sherpa_recognizer);
+        SherpaOnnxDestroyOnlineStream(sherpa_stream);
+
+        return 1;
+    }
+    sherpa_stream = SherpaOnnxCreateOnlineStream(sherpa_recognizer);
+
+    // Configure the speech denoiser model
     memset(&denoiser_config, 0, sizeof(denoiser_config));
     denoiser_config.model.dpdfnet.model = "/home/dylenthomas/LiveASRonRPi-4/.models/dpdfnet_baseline.onnx";
     denoiser_config.model.num_threads = 2;
     denoiser_config.model.debug = 0;
     denoiser_config.model.provider = "cpu";
 
-    const SherpaOnnxOnlineRecognizer* sherpa_recognizer = SherpaOnnxCreateOnlineRecognizer(&recognizer_config);
-    if (sherpa_recognizer == NULL) {
-        fprintf(stderr, "Please check your config!\n");
-        goto sherpa_recognizer_fail;
-    }
-    const SherpaOnnxOnlineStream* sherpa_stream = SherpaOnnxCreateOnlineStream(sherpa_recognizer);
-
-    const SherpaOnnxOnlineSpeechDenoiser* sd = SherpaOnnxCreateOnlineSpeechDenoiser(&denoiser_config);
+    sd = SherpaOnnxCreateOnlineSpeechDenoiser(&denoiser_config);
     if (sd == NULL) {
         fprintf(stderr, "Failed to create speech denoiser\n");
-        goto sherpa_denoiser_fail;
+        SherpaOnnxDestroyOnlineRecognizer(sherpa_recognizer);
+        SherpaOnnxDestroyOnlineStream(sherpa_stream);
+        SherpaOnnxDestroyOnlineSpeechDenoiser(sd);
+
+        return 1;
     }
+
+    return 0;
+}
+
+int main() {
+    signal(SIGINT, intHandler); // Allow safe exit from program with Ctrl-C
+
+    srandom(time(NULL)); // Initialize the random function
+
+    double peak_value = 0.0;
+    int iterations_held = 0;
+    int iterations_decayed = 0;
+
+    long updated1 = 0L;
+    long updated2 = 0L;
+    float mic1_buffer[MIC_BUFFER_LEN] = {0};
+    float mic2_buffer[MIC_BUFFER_LEN] = {0};
+
+    int ret;
+    long mic1_last_updated;
+    long mic2_last_updated;
+
+    int vad_previously_triggered = 0;
+
+    // Initialize Sherpa models ========================================================================================
+
+    if (initializeSherpa()) { return 1; }
+
+    // Initialize the ORT Api ==========================================================================================
+
+    const OrtApi* ort = initializeORT();
+    if (ort == NULL) { goto ort_initialize_fail; }
+
+    // Initialize Microphones ==========================================================================================
+
+    printf("Initializing microphones...\n");
+
+    snd_pcm_t* mic1_ch;
+    init_mic(mic1_name, &mic1_ch, SAMPLE_RATE, CHANNELS );
+    snd_pcm_t* mic2_ch;
+    init_mic(mic2_name, &mic2_ch, SAMPLE_RATE, CHANNELS);
+
+    // Setup threads ===================================================================================================
 
     struct transcribe_thread_data transcribe_data;
     pthread_mutex_t transcribe_mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t transcribe_cond = PTHREAD_COND_INITIALIZER;
-
     transcribe_data.recognizer = sherpa_recognizer;
     transcribe_data.stream = sherpa_stream;
     transcribe_data.denoiser = sd;
@@ -257,39 +332,9 @@ int main(int argc, char *argv[]) {
     transcribe_data.mutex = &transcribe_mutex;
     transcribe_data.ready = 0;
 
-    //struct keywordHM keywords = createKeywordHM(KEYWORD_CONF);
-
-    double peak_value = 0.0;
-    int iterations_held = 0;
-    int iterations_decayed = 0;
-
-    atomic_long updated1 = ATOMIC_VAR_INIT(0);
-    atomic_long updated2 = ATOMIC_VAR_INIT(0);
-    float mic1_buffer[MIC_BUFFER_LEN] = {0};
-    float mic2_buffer[MIC_BUFFER_LEN] = {0};
-
-    int ret;
-    long int mic1_last_updated;
-    long int mic2_last_updated;
-
-    int vad_previously_triggered = 0;
-// Initialize the ORT Api --------------------------------------------------------------------------
-    const OrtApi* ort = initializeORT();
-    if (ort == NULL) { goto ort_initialize_fail; }
-// Initialize Microphone ---------------------------------------------------------------------------
-	printf("Initializing microphones...\n");
-
-	snd_pcm_t* mic1_ch;
-	init_mic(mic1_name, &mic1_ch, SAMPLE_RATE, CHANNELS, MIC_BUFFER_LEN);
-
-    snd_pcm_t* mic2_ch;
-    init_mic(mic2_name, &mic2_ch, SAMPLE_RATE, CHANNELS, MIC_BUFFER_LEN);
-
     struct mic_thread_data mic_data[2];
-
     pthread_mutex_t mic_mutex1 = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_t mic_mutex2 = PTHREAD_MUTEX_INITIALIZER;
-
     mic_data[0].buffer = mic1_buffer;
     mic_data[0].device = mic1_ch;
     mic_data[0].updated = &updated1;
@@ -298,12 +343,14 @@ int main(int argc, char *argv[]) {
     mic_data[1].device = mic2_ch;
     mic_data[1].updated = &updated2;
     mic_data[1].mutex = &mic_mutex2;
-// Initialize threads ------------------------------------------------------------------------------	
+
+    // Start threads ===================================================================================================
+
     pthread_t thread[NUM_THREADS];
     
     printf("Starting audio threads.\n");
     run_mic_threads = 1;
-    
+
     if ((ret = pthread_create(&thread[0], NULL, readMicData, &mic_data[0])) != 0) { 
         fprintf(stderr, "Error: failed to create first mic thread %d", ret);
         goto first_mic_thread_fail;
@@ -323,10 +370,16 @@ int main(int argc, char *argv[]) {
 
     mic1_last_updated = *mic_data[0].updated;
     mic2_last_updated = *mic_data[1].updated;
-// -------------------------------------------------------------------------------------------------
+
+    // Main Loop =======================================================================================================
     while (keep_running) {
         int hold_iterations = 5;
         const double speech_threshold = 0.7; // trigger threshold to start transcription
+
+        float speech_prob;
+        OrtValue** outputs = NULL;
+
+        float rms1 = 0, rms2 = 0;
 
         // wait until both buffers are populated
         if (mic1_last_updated == *mic_data[0].updated) { continue; }
@@ -338,7 +391,6 @@ int main(int argc, char *argv[]) {
         pthread_mutex_lock(mic_data[0].mutex);
         pthread_mutex_lock(mic_data[1].mutex);
 
-        float rms1 = 0, rms2 = 0;
         for (int i = 0; i < MIC_BUFFER_LEN; i++) {
             rms1 += mic_data[0].buffer[i] * mic_data[0].buffer[i];
             rms2 += mic_data[1].buffer[i] * mic_data[1].buffer[i];
@@ -347,9 +399,6 @@ int main(int argc, char *argv[]) {
 
         pthread_mutex_unlock(mic_data[0].mutex);
         pthread_mutex_unlock(mic_data[1].mutex);
-
-		float speech_prob;
-        OrtValue** outputs = NULL;
 
 		speech_prob = getSpeechProb(&outputs, ort);
         if (speech_prob == -2.0f) { continue; }
@@ -430,10 +479,7 @@ first_mic_thread_fail:
     printf("Released all ORT bindings.\n");
 
 ort_initialize_fail:
-sherpa_denoiser_fail:
     SherpaOnnxDestroyOnlineSpeechDenoiser(sd);
-
-sherpa_recognizer_fail:
     SherpaOnnxDestroyOnlineRecognizer(sherpa_recognizer);
     SherpaOnnxDestroyOnlineStream(sherpa_stream);
 

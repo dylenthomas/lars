@@ -10,14 +10,29 @@
  * @return new instance of transcript_queue
  */
 transcript_queue* initialize() {
-   // TODO: For some reason I have heard malloc is bad, check that
-   // TODO: Check if this is the right way to instantiate
    transcript_queue* self = malloc(sizeof(transcript_queue));
-   self->backingArray = malloc(sizeof(float**) * STARTING_LENGTH);
+   if (!self) { return NULL; }
+
+   self->backingArray = malloc(sizeof(float*) * MAX_TRANSCRIPT_QUEUE_LENGTH);
+   if (!self->backingArray) {
+      free(self);
+      return NULL;
+   }
+
    self->queueSize = 0;
-   self->backingArraySize = STARTING_LENGTH;
 
    return self;
+}
+
+/**
+ * Destroy the transcript queue
+ *
+ * @param self current instance of the transcript_queue
+ */
+void destroy(transcript_queue* self) {
+   if (!self) { return; }
+   free(self->backingArray);
+   free(self);
 }
 
 /**
@@ -28,16 +43,10 @@ transcript_queue* initialize() {
  */
 float* retrieveFront(transcript_queue* self) {
    float* front = self->backingArray[0];
-   int newSize = self->queueSize;
 
-   if (newSize < self->backingArraySize / 2 && self->backingArraySize > STARTING_LENGTH) { newSize /= 2; }
-   newSize -= 1; // Account for removed item
+   // Shift all elements down one
+   memmove(&self->backingArray[0], &self->backingArray[1], (self->queueSize - 1) * sizeof(float*));
 
-   float* tmp[newSize];
-   // TODO: Check if this is the right way to skip the first item
-   memcpy(tmp, (char*)self->backingArray + sizeof(float*), newSize * sizeof(float*));
-
-   self->backingArray = tmp;
    self->queueSize--;
 
    return front;
@@ -50,18 +59,9 @@ float* retrieveFront(transcript_queue* self) {
  * @param buffer Audio buffer to add to the queue
  */
 void addToQueue(transcript_queue* self, float* buffer) {
-   if (self->queueSize + 1 >= self->backingArraySize) {
-      int newSize = self->queueSize * 2;
-      newSize += 1; // Account for new item
-
-      float* tmp[newSize];
-      memcpy(tmp, self->backingArray, (newSize) * sizeof(float*));
-      tmp[self->queueSize] = buffer;
-
-      self->queueSize++;
-      self->backingArray = tmp;
-   } else {
-      self->backingArray[self->queueSize] = buffer;
-      self->queueSize++;
+   if (self->queueSize + 1 > MAX_TRANSCRIPT_QUEUE_LENGTH) {
+      // TODO: Setup error state here
    }
+   self->backingArray[self->queueSize] = buffer;
+   self->queueSize++;
 }

@@ -34,10 +34,6 @@
 // Length of padding to add to the end of ASR
 #define TAIL_PADDING_LENGTH 8000
 
-// TODO: Make a Queue "class" so I can have a managed queue for transcription and other things
-// TODO: Replace atomic usages with mutexes
-// TODO: Improve in file documentation (add better comments)
-
 static OrtEnv* ort_env = NULL;
 static OrtSessionOptions* ort_session_opts = NULL;
 static OrtCUDAProviderOptionsV2* ort_cuda_opts = NULL;
@@ -70,12 +66,18 @@ static const char* mic2_name = "plughw:CARD=Snowball_1,DEV=0";
 
 static volatile int keep_running = 1;
 
+SherpaOnnxOnlineRecognizerConfig recognizer_config;
+const SherpaOnnxOnlineRecognizer* sherpa_recognizer;
+const SherpaOnnxOnlineStream* sherpa_stream;
+SherpaOnnxOnlineSpeechDenoiserConfig denoiser_config;
+const SherpaOnnxOnlineSpeechDenoiser* sd;
+
 void intHandler(int dummy);
 
 struct mic_thread_data {
     float* buffer;
     snd_pcm_t* device;
-    atomic_long* updated;
+    long* updated;
     pthread_mutex_t* mutex;
 };
 
@@ -104,5 +106,7 @@ static float getSpeechProb(OrtValue*** outputs, const OrtApi* ort);
 static void* readMicData(void* ptr);
 
 static void* transcribe(void* ptr);
+
+static int initalizeSherpa();
 
 #endif //LARS_MAIN_H
