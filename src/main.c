@@ -13,6 +13,9 @@
 
 // TODO: Setup unit tests for the queue
 // TODO: Rethink the mic updated functionality
+// TODO: Start thinking about thread structure to put the queue before transcription and have it manage that
+//  I think that the main thread can just update the queue, and the transcription thread is
+//  checking the queue constantly for new data to transcribe
 
 void intHandler(int dummy) {
     keep_running = 0;
@@ -381,15 +384,25 @@ int main() {
 
         float rms1 = 0, rms2 = 0;
 
-        // wait until both buffers are populated
-        if (mic1_last_updated == *mic_data[0].updated) { continue; }
-        mic1_last_updated = *mic_data[0].updated;
-
-        if (mic2_last_updated == *mic_data[1].updated) { continue; }
-        mic2_last_updated = *mic_data[1].updated;
-
+        // Accessing mic data ==========================================================================================
         pthread_mutex_lock(mic_data[0].mutex);
         pthread_mutex_lock(mic_data[1].mutex);
+
+        // Check if the first mic has been updated
+        if (mic1_last_updated == *mic_data[0].updated) {
+            pthread_mutex_unlock(mic_data[0].mutex);
+            pthread_mutex_unlock(mic_data[1].mutex);
+            continue;
+        }
+        mic1_last_updated = *mic_data[0].updated;
+
+        // Check if the second mic has been updated
+        if (mic2_last_updated == *mic_data[1].updated) {
+            pthread_mutex_unlock(mic_data[0].mutex);
+            pthread_mutex_unlock(mic_data[1].mutex);
+            continue;
+        }
+        mic2_last_updated = *mic_data[1].updated;
 
         for (int i = 0; i < MIC_BUFFER_LEN; i++) {
             rms1 += mic_data[0].buffer[i] * mic_data[0].buffer[i];
@@ -399,10 +412,11 @@ int main() {
 
         pthread_mutex_unlock(mic_data[0].mutex);
         pthread_mutex_unlock(mic_data[1].mutex);
+        // =============================================================================================================
 
 		speech_prob = getSpeechProb(&outputs, ort);
         if (speech_prob == -2.0f) { continue; }
-        if (speech_prob == -1.0f) { goto end_of_loop;; }
+        if (speech_prob == -1.0f) { goto end_of_loop; }
         
         if (speech_prob > peak_value) { // increase
             peak_value = speech_prob;
@@ -428,6 +442,7 @@ int main() {
             pthread_cond_signal(transcribe_data.cond);
 
             pthread_mutex_unlock(transcribe_data.mutex);
+
             vad_previously_triggered = 1;
         } else if (vad_previously_triggered) {
             pthread_mutex_lock(transcribe_data.mutex);
@@ -438,6 +453,7 @@ int main() {
             pthread_cond_signal(transcribe_data.cond);
 
             pthread_mutex_unlock(transcribe_data.mutex);
+
             vad_previously_triggered = 0;
             peak_value = 0.0;
         }
