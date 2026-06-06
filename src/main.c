@@ -11,11 +11,20 @@
 #include "mic_access.h"
 #include "sherpa-onnx/c-api/c-api.h"
 
+// =====================================================================================================================
+// - 1 Corinthians 10:31
+// =====================================================================================================================
+
+// TODO: Add new mics
 // TODO: Setup unit tests for the queue
-// TODO: Rethink the mic updated functionality
 // TODO: Start thinking about thread structure to put the queue before transcription and have it manage that
 //  I think that the main thread can just update the queue, and the transcription thread is
 //  checking the queue constantly for new data to transcribe
+// TODO: BEFORE I start implementing the queue: Get transcription working with the new microphone setup
+// TODO: Rethink the mic updated functionality
+
+// TODO: For communication with the RaspberryPi think about using mosquitto (or another MQTT tool)
+// TODO: On the RaspberryPi use pinctrl (or other similar cli) to control hardware states
 
 void intHandler(int dummy) {
     keep_running = 0;
@@ -73,7 +82,7 @@ static const OrtApi* initializeORT() {
 	if (badStatus(ort->GetAllocatorWithDefaultOptions(&ort_alloc), ort)) { goto ort_cpu_mem_info_fail; }
 
 	if (badStatus(ort->CreateTensorWithDataAsOrtValue(
-		ort_gpu_mem_info, sample_rate, sizeof(sample_rate), sample_rate_shape, SAMPLE_RATE_DIMS,
+		ort_gpu_mem_info, (void*)sample_rate, sizeof(sample_rate), sample_rate_shape, SAMPLE_RATE_DIMS,
 		ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &vad_sr_tensor), ort)) { goto ort_sr_tensor_fail; }
 
 	// create initializing state for model of all zeros
@@ -267,7 +276,7 @@ static int initializeSherpa() {
 
     // Configure the speech denoiser model
     memset(&denoiser_config, 0, sizeof(denoiser_config));
-    denoiser_config.model.dpdfnet.model = "/home/dylenthomas/LiveASRonRPi-4/.models/dpdfnet_baseline.onnx";
+    denoiser_config.model.dpdfnet.model = denoiser_model_path;
     denoiser_config.model.num_threads = 2;
     denoiser_config.model.debug = 0;
     denoiser_config.model.provider = "cpu";
@@ -294,14 +303,16 @@ int main() {
     int iterations_held = 0;
     int iterations_decayed = 0;
 
-    long updated1 = 0L;
-    long updated2 = 0L;
     float mic1_buffer[MIC_BUFFER_LEN] = {0};
     float mic2_buffer[MIC_BUFFER_LEN] = {0};
+    float mic3_buffer[MIC_BUFFER_LEN] = {0};
+    float mic4_buffer[MIC_BUFFER_LEN] = {0};
+    float mic5_buffer[MIC_BUFFER_LEN] = {0};
 
     int ret;
-    long mic1_last_updated;
-    long mic2_last_updated;
+
+    snd_pcm_t* mic_chs[NUM_MICS];
+    long mic_updates[NUM_MICS];
 
     int vad_previously_triggered = 0;
 
@@ -316,12 +327,13 @@ int main() {
 
     // Initialize Microphones ==========================================================================================
 
+    // TODO: Move all the microphone variables to arrays to make modifying all of them at once easier.
+
     printf("Initializing microphones...\n");
 
-    snd_pcm_t* mic1_ch;
-    init_mic(mic1_name, &mic1_ch, SAMPLE_RATE, CHANNELS );
-    snd_pcm_t* mic2_ch;
-    init_mic(mic2_name, &mic2_ch, SAMPLE_RATE, CHANNELS);
+    for (int i = 0; i < NUM_MICS; i++) {
+        init_mic(mic1_name, &mic_chs[i], SAMPLE_RATE, CHANNELS );
+    }
 
     // Setup threads ===================================================================================================
 
@@ -335,17 +347,37 @@ int main() {
     transcribe_data.mutex = &transcribe_mutex;
     transcribe_data.ready = 0;
 
-    struct mic_thread_data mic_data[2];
-    pthread_mutex_t mic_mutex1 = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_t mic_mutex2 = PTHREAD_MUTEX_INITIALIZER;
+    struct mic_thread_data mic_data[NUM_MICS];
+    pthread_mutex_t mic1_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t mic2_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t mic3_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t mic4_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t mic5_mutex = PTHREAD_MUTEX_INITIALIZER;
+
     mic_data[0].buffer = mic1_buffer;
-    mic_data[0].device = mic1_ch;
-    mic_data[0].updated = &updated1;
-    mic_data[0].mutex = &mic_mutex1;
+    mic_data[0].device = mic_chs[0];
+    mic_data[0].updated = &mic_updates[0];
+    mic_data[0].mutex = &mic1_mutex;
+
     mic_data[1].buffer = mic2_buffer;
-    mic_data[1].device = mic2_ch;
-    mic_data[1].updated = &updated2;
-    mic_data[1].mutex = &mic_mutex2;
+    mic_data[1].device = mic_chs[1];
+    mic_data[1].updated = &mic_updates[1];
+    mic_data[1].mutex = &mic2_mutex;
+
+    mic_data[2].buffer = mic3_buffer;
+    mic_data[2].device = mic_chs[2];
+    mic_data[2].updated = &mic_updates[2];
+    mic_data[2].mutex = &mic3_mutex;
+
+    mic_data[3].buffer = mic4_buffer;
+    mic_data[3].device = mic_chs[3];
+    mic_data[3].updated = &mic_updates[3];
+    mic_data[3].mutex = &mic4_mutex;
+
+    mic_data[4].buffer = mic5_buffer;
+    mic_data[4].device = mic_chs[4];
+    mic_data[4].updated = &mic_updates[4];
+    mic_data[4].mutex = &mic5_mutex;
 
     // Start threads ===================================================================================================
 
@@ -354,25 +386,26 @@ int main() {
     printf("Starting audio threads.\n");
     run_mic_threads = 1;
 
-    if ((ret = pthread_create(&thread[0], NULL, readMicData, &mic_data[0])) != 0) { 
-        fprintf(stderr, "Error: failed to create first mic thread %d", ret);
-        goto first_mic_thread_fail;
-    }
-    printf("Started mic1 thread.\n");
+    int num_mics_initialized = 0;
+    while (num_mics_initialized < NUM_MICS) {
+        if ((ret = pthread_create(&thread[num_mics_initialized], NULL, readMicData, &mic_data[num_mics_initialized])) != 0) {
+            fprintf(stderr, "Error: failed to create mic %d thread. Code: %d", num_mics_initialized, ret);
+            goto mic_threads_fail;
+        }
 
-    if ((ret = pthread_create(&thread[1], NULL, readMicData, &mic_data[1])) != 0) { 
-        fprintf(stderr, "Error: failed to create second mic thread %d", ret);
-        goto second_mic_thread_fail;
-    }
-    printf("Started mic2 thread.\n");
-
-    if ((ret = pthread_create(&thread[2], NULL, transcribe, &transcribe_data)) != 0) {
-        fprintf(stderr, "Error: failed to create transcribe thread %d", ret);
-        goto second_mic_thread_fail;
+        num_mics_initialized++;
     }
 
-    mic1_last_updated = *mic_data[0].updated;
-    mic2_last_updated = *mic_data[1].updated;
+    // Initialize the local mic update fields
+    for (int i = 0; i < NUM_MICS; i++) {
+        mic_updates[i] = *mic_data[i].updated;
+    }
+
+
+    if ((ret = pthread_create(&thread[NUM_THREADS - 1], NULL, transcribe, &transcribe_data)) != 0) {
+        fprintf(stderr, "Error: failed to create transcription thread. Code: %d", ret);
+        goto transcribe_thread_fail;
+    }
 
     // Main Loop =======================================================================================================
     while (keep_running) {
@@ -385,24 +418,26 @@ int main() {
         float rms1 = 0, rms2 = 0;
 
         // Accessing mic data ==========================================================================================
-        pthread_mutex_lock(mic_data[0].mutex);
-        pthread_mutex_lock(mic_data[1].mutex);
 
-        // Check if the first mic has been updated
-        if (mic1_last_updated == *mic_data[0].updated) {
-            pthread_mutex_unlock(mic_data[0].mutex);
-            pthread_mutex_unlock(mic_data[1].mutex);
-            continue;
-        }
-        mic1_last_updated = *mic_data[0].updated;
+        // TODO: I am not sure if this method of accessing mic data is the best, maybe it should be processed in another
+        //  thread because of how many mics there are.
+        //  Maybe I should have a thread for combining mics 3-5 together and a thread that determines which node to use.
 
-        // Check if the second mic has been updated
-        if (mic2_last_updated == *mic_data[1].updated) {
-            pthread_mutex_unlock(mic_data[0].mutex);
-            pthread_mutex_unlock(mic_data[1].mutex);
-            continue;
+        for (int i = 0; i < NUM_MICS; i++) {
+            pthread_mutex_lock(mic_data[i].mutex);
         }
-        mic2_last_updated = *mic_data[1].updated;
+
+        // TODO: I don't think that waiting for all five mics to be updated at the same time is necessary or smart.
+        for (int i = 0; i < NUM_MICS; i++) {
+            if (mic_updates[i] == *mic_data[i].updated) {
+                for (int j = 0; i < NUM_MICS; j++) {
+                    pthread_mutex_unlock(mic_data[j].mutex);
+                }
+                goto end_of_loop;
+            }
+        }
+
+        // TODO: Combine the last three mics into a single stream using fft stuff.
 
         for (int i = 0; i < MIC_BUFFER_LEN; i++) {
             rms1 += mic_data[0].buffer[i] * mic_data[0].buffer[i];
@@ -410,8 +445,9 @@ int main() {
         }
         memcpy(combined_buffer, rms1 > rms2 ? mic_data[0].buffer : mic_data[1].buffer, MIC_BUFFER_LEN * sizeof(float));
 
-        pthread_mutex_unlock(mic_data[0].mutex);
-        pthread_mutex_unlock(mic_data[1].mutex);
+        for (int i = 0; i < NUM_MICS; i++) {
+            pthread_mutex_unlock(mic_data[i].mutex);
+        }
         // =============================================================================================================
 
 		speech_prob = getSpeechProb(&outputs, ort);
@@ -459,25 +495,25 @@ int main() {
         }
         
         // Cleanup iteration
-end_of_loop:
+clean_up_loop:
         ort->ReleaseValue(outputs[0]);
         ort->ReleaseValue(vad_state_tensor);
         vad_state_tensor = outputs[1];
         outputs[1] = NULL;
+end_of_loop:
 	}
 	
 // Cleanup for program exit ------------------------------------------------------------------------
-second_mic_thread_fail:
-    printf("Cleaning up second mic.\n");
-    run_mic_threads = 0;
-    pthread_join(thread[1], NULL);
-    close_mic(mic2_ch);
+transcribe_thread_fail:
+    pthread_join(thread[NUM_THREADS - 1], NULL);
 
-first_mic_thread_fail:
-    printf("Cleaning up first mic.\n");
+mic_threads_fail:
     run_mic_threads = 0;
-    pthread_join(thread[0], NULL);
-	close_mic(mic1_ch);
+    for (int i = 0; i < num_mics_initialized; i++) {
+        fprintf(stdout, "Cleaning up mic %d", i + 1);
+        pthread_join(thread[i], NULL);
+        close_mic(mic_ch_list[i]);
+    }
 
     keep_running = 0;
 

@@ -1,10 +1,8 @@
 add_library(lars_core STATIC
-        config_parser.c
+        #config_parser.c
         fft.c
         mic_access.c
-        queue.c
-        ../include/queue.h
-        ../include/main.h
+        #queue.c
 )
 
 target_include_directories(lars_core PUBLIC
@@ -26,11 +24,7 @@ target_link_libraries(lars_core PUBLIC
         CUDA::cublas
 )
 
-add_executable(lars main.c
-        queue.c
-        ../include/queue.h
-        ../include/main.h
-)
+add_executable(lars main.c)
 target_link_libraries(lars PRIVATE lars_core)
 
 set_target_properties(lars PROPERTIES

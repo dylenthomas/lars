@@ -29,7 +29,8 @@
 #define DEVICE_ID 0
 #define GPU_ALIGNMENT 0
 
-#define NUM_THREADS 3
+#define NUM_THREADS 6
+#define NUM_MICS 5
 
 // Length of padding to add to the end of ASR
 #define TAIL_PADDING_LENGTH 8000
@@ -60,9 +61,13 @@ static const char* decoder_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/
 static const char* joiner_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/sherpa-onnx-streaming-zipformer-en-2023-06-21/joiner-epoch-99-avg-1.onnx";
 static const char* tokens_filename = "/home/dylenthomas/LiveASRonRPi-4/.models/sherpa-onnx-streaming-zipformer-en-2023-06-21/tokens.txt";
 static const char* vad_model_path = "/home/dylenthomas/LiveASRonRPi-4/.models/silero_vad_16k_op15.onnx";
+static const char* denoiser_model_path = "/home/dylenthomas/LiveASRonRPi-4/.models/dpdfnet8.onnx";
 static const char* keyword_config_path = "";
 static const char* mic1_name = "plughw:CARD=Snowball,DEV=0";
 static const char* mic2_name = "plughw:CARD=Snowball_1,DEV=0";
+static const char* mic3_name = "plughw:CARD=Device,DEV=0";
+static const char* mic4_name = "plughw:CARD=Device_1,DEV=0";
+static const char* mic5_name = "plughw:CARD=Device_2,DEV=0";
 
 static volatile int keep_running = 1;
 
