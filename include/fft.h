@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-typedef struct{float Re; float Im;} complex;
+typedef struct{double Re; double Im;} complex;
 
 #ifndef PI
 # define PI     3.14159265358979323846264338327950288

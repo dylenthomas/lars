@@ -15,28 +15,15 @@
 // - 1 Corinthians 10:31
 // =====================================================================================================================
 
-// TODO: Add new mics
-// TODO: Setup unit tests for the queue
-// TODO: Start thinking about thread structure to put the queue before transcription and have it manage that
-//  I think that the main thread can just update the queue, and the transcription thread is
-//  checking the queue constantly for new data to transcribe
-// TODO: BEFORE I start implementing the queue: Get transcription working with the new microphone setup
-// TODO: Rethink the mic updated functionality
-
 // TODO: For communication with the RaspberryPi think about using mosquitto (or another MQTT tool)
 // TODO: On the RaspberryPi use pinctrl (or other similar cli) to control hardware states
+
+// TODO: Consider the scenario where a mic is not updating for multiple iterations and how to handle that
 
 void intHandler(int dummy) {
     keep_running = 0;
 }
 
-/**
- * Check status of any ORT function
- *
- * @param status Status pointer returned by ORT functino
- * @param ort ORT Api pointer
- * @return good or bad status (1 = bad status and function failed, 0 = good status)
- */
 static int badStatus(OrtStatus* status, const OrtApi* ort) {
 	// Make sure the API was accessed correctly 
 	if (status != NULL) {
@@ -48,11 +35,6 @@ static int badStatus(OrtStatus* status, const OrtApi* ort) {
 	return 0;
 }
 
-/**
- * Initialize the ORT environment and necessary tensors
- *
- * @return ORT Api pointer
- */
 static const OrtApi* initializeORT() {
     printf("Initializing ORT...\n");
 	const OrtApi* ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
@@ -129,13 +111,6 @@ static const OrtApi* initializeORT() {
     return NULL;
 }
 
-/**
- * Get the speech probability form the VAD model outputs
- *
- * @param outputs Outputs from the VAD model
- * @param ort ORT Api pointer
- * @return probability of speech (if < 0.0f then something went wrong)
- */
 static float getSpeechProb(OrtValue*** outputs, const OrtApi* ort) {
     size_t output_count = 2;
     if (badStatus(ort->RunWithBinding(ort_session, ort_run_opts, ort_io_binding), ort)) { return -2.0f; }
@@ -149,16 +124,16 @@ static float getSpeechProb(OrtValue*** outputs, const OrtApi* ort) {
     return prob_data[0];
 }
 
-/**
- * Mic thread function that persistently runs throughout program life
- *
- * @param ptr thread struct containing all necessary information
- * @return NULL
- */
 static void* readMicData(void* ptr) {
-    struct mic_thread_data* args = (struct mic_thread_data*)ptr;
+    struct mic_thread_data* args = ptr;
 
     while (run_mic_threads) {
+        pthread_mutex_lock(args->mutex);
+        while (args->data_ready) {
+            pthread_cond_wait(args->cond, args->mutex);
+        }
+        pthread_mutex_unlock(args->mutex);
+
         int16_t tmp_buffer[MIC_BUFFER_LEN] = {0};
 	    int i = 0;
 
@@ -166,22 +141,59 @@ static void* readMicData(void* ptr) {
         // convert int mic data to float	
         pthread_mutex_lock(args->mutex);
 	    while (i < MIC_BUFFER_LEN) { args->buffer[i] = (float)tmp_buffer[i] / 32768.0f; i++; }
-
-        // avoid predicting on old values
-        long newUpdated = random();
-        args->updated = &newUpdated;
+        args->data_ready = 1;
         pthread_mutex_unlock(args->mutex);
     }
 
     return NULL;
 }
 
-/**
- * Transcribe a given audio buffer into speech
- *
- * @param ptr thread struct containing all necessary information
- * @return NULL
- */
+static void unlockMicMutexes(struct mic_thread_data* mics[], const int num_mics) {
+    for (int i = 0; i < num_mics; i++) {
+        pthread_mutex_unlock(mics[i]->mutex);
+    }
+}
+
+static void* createNode(void* ptr) {
+    struct node_thread_data* args = ptr;
+
+    while (run_node_threads) {
+        pthread_mutex_lock(args->mutex);
+        while (args->data_ready) {
+            pthread_cond_wait(args->cond, args->mutex);
+        }
+        pthread_mutex_unlock(args->mutex);
+
+        int num_ready = 0;
+        for (int i = 0; i < args->num_mics; i++) {
+            pthread_mutex_lock(args->mics[i]->mutex);
+            num_ready += args->mics[i]->data_ready;
+        }
+        if (num_ready != args->num_mics) {
+            unlockMicMutexes(args->mics, args->num_mics);
+        } else {
+            // TODO: Combine the microphones, try something other than delay and combine
+            args->data_ready = 1;
+            unlockMicMutexes(args->mics, args->num_mics);
+        }
+    }
+
+    return NULL;
+}
+
+static int max(const float values[], const int num_vals) {
+    int max_loc = 0;
+    float max_val = -INFINITY;
+    for (int i = 0; i < num_vals; i++) {
+        if (values[i] >  max_val) {
+            max_val = values[i];
+            max_loc = i;
+        }
+    }
+
+    return max_loc;
+}
+
 static void* transcribe(void* ptr) {
     struct transcribe_thread_data* args = ptr;
     const SherpaOnnxOnlineRecognizer* recognizer = args->recognizer;
@@ -251,6 +263,61 @@ static void* transcribe(void* ptr) {
     return NULL;
 }
 
+static int findSampleDelay(const float* ref_buffer, const float* other_buffer) {
+    // Find sample delay using frequency domain formula
+    int i = 0;
+    const int n = MIC_BUFFER_LEN;
+    int m_delay = 0;
+
+    complex x[n], y[n], tmp[n], Rxy[n];
+
+    while (i < n) {
+        x[i].Re = ref_buffer[i];
+        x[i].Im = 0.0f;
+        y[i].Re = other_buffer[i];
+        y[i].Im = 0.0f;
+
+        i++;
+    }
+
+    fft(x, n, tmp);
+    fft(y, n, tmp);
+
+    i = 0;
+    while (i < n) {
+        // compute correlation
+        // the total fomula is the dot product between x and complex conjugate of y
+        //  normalized by the magnitude
+        const double a = x[i].Re;
+        const double b = x[i].Im;
+        const double c = y[i].Re;
+        const double d = y[i].Im;
+
+        const double m1 = pow(a*c + b*d, 2);
+        const double m2 = pow(b*c - a*d, 2);
+        const double mag = sqrt(m1 + m2);
+
+        Rxy[i].Re = (a*c + b*d)/mag;
+        Rxy[i].Im = (b*c - a*d)/mag;
+
+        i++;
+    }
+
+    ifft(Rxy, n, tmp);
+    // The index of the max value represents our delay
+    i = 0;
+    while (i < n) {
+        // compare absolute values
+        const double a = (Rxy[i].Re < 0.0) ? -Rxy[i].Re : Rxy[i].Re;
+        const double b = (Rxy[m_delay].Re < 0.0) ? -Rxy[m_delay].Re : Rxy[m_delay].Re;
+        m_delay = (a > b) ? i : m_delay;
+
+        i++;
+    }
+
+    return (m_delay > n/2) ? m_delay - n : m_delay;
+}
+
 static int initializeSherpa() {
     // Configure the ASR model
     memset(&recognizer_config, 0, sizeof(recognizer_config));
@@ -297,23 +364,10 @@ static int initializeSherpa() {
 int main() {
     signal(SIGINT, intHandler); // Allow safe exit from program with Ctrl-C
 
-    srandom(time(NULL)); // Initialize the random function
-
     double peak_value = 0.0;
     int iterations_held = 0;
     int iterations_decayed = 0;
-
-    float mic1_buffer[MIC_BUFFER_LEN] = {0};
-    float mic2_buffer[MIC_BUFFER_LEN] = {0};
-    float mic3_buffer[MIC_BUFFER_LEN] = {0};
-    float mic4_buffer[MIC_BUFFER_LEN] = {0};
-    float mic5_buffer[MIC_BUFFER_LEN] = {0};
-
     int ret;
-
-    snd_pcm_t* mic_chs[NUM_MICS];
-    long mic_updates[NUM_MICS];
-
     int vad_previously_triggered = 0;
 
     // Initialize Sherpa models ========================================================================================
@@ -326,13 +380,11 @@ int main() {
     if (ort == NULL) { goto ort_initialize_fail; }
 
     // Initialize Microphones ==========================================================================================
-
-    // TODO: Move all the microphone variables to arrays to make modifying all of them at once easier.
-
     printf("Initializing microphones...\n");
 
+    snd_pcm_t* mic_chs[NUM_MICS];
     for (int i = 0; i < NUM_MICS; i++) {
-        init_mic(mic1_name, &mic_chs[i], SAMPLE_RATE, CHANNELS );
+        init_mic(mic_names[i], &mic_chs[i], SAMPLE_RATE, CHANNELS );
     }
 
     // Setup threads ===================================================================================================
@@ -348,39 +400,51 @@ int main() {
     transcribe_data.ready = 0;
 
     struct mic_thread_data mic_data[NUM_MICS];
+    float mic1_buffer[MIC_BUFFER_LEN] = {0};
+    float mic2_buffer[MIC_BUFFER_LEN] = {0};
+    float mic3_buffer[MIC_BUFFER_LEN] = {0};
+    float mic4_buffer[MIC_BUFFER_LEN] = {0};
+    float mic5_buffer[MIC_BUFFER_LEN] = {0};
     pthread_mutex_t mic1_mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_t mic2_mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_t mic3_mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_t mic4_mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_t mic5_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t mic1_cond = PTHREAD_COND_INITIALIZER;
+    pthread_cond_t mic2_cond = PTHREAD_COND_INITIALIZER;
+    pthread_cond_t mic3_cond = PTHREAD_COND_INITIALIZER;
+    pthread_cond_t mic4_cond = PTHREAD_COND_INITIALIZER;
+    pthread_cond_t mic5_cond = PTHREAD_COND_INITIALIZER;
 
-    mic_data[0].buffer = mic1_buffer;
-    mic_data[0].device = mic_chs[0];
-    mic_data[0].updated = &mic_updates[0];
-    mic_data[0].mutex = &mic1_mutex;
+    float* mic_buffers[NUM_MICS] = {mic1_buffer, mic2_buffer, mic3_buffer, mic4_buffer, mic5_buffer};
+    pthread_mutex_t* mic_mutexes[NUM_MICS] = {&mic1_mutex, &mic2_mutex, &mic3_mutex, &mic4_mutex, &mic5_mutex};
+    pthread_cond_t* mic_conds[NUM_MICS] = {&mic1_cond, &mic2_cond, &mic3_cond, &mic4_cond, &mic5_cond};
 
-    mic_data[1].buffer = mic2_buffer;
-    mic_data[1].device = mic_chs[1];
-    mic_data[1].updated = &mic_updates[1];
-    mic_data[1].mutex = &mic2_mutex;
+    for (int i = 0; i < NUM_MICS; i++) {
+        mic_data[i].buffer = mic_buffers[i];
+        mic_data[i].device = mic_chs[i];
+        mic_data[i].data_ready = 0;
+        mic_data[i].mutex = mic_mutexes[i];
+        mic_data[i].cond = mic_conds[i];
+    }
 
-    mic_data[2].buffer = mic3_buffer;
-    mic_data[2].device = mic_chs[2];
-    mic_data[2].updated = &mic_updates[2];
-    mic_data[2].mutex = &mic3_mutex;
+    struct node_thread_data node_1;
+    struct mic_thread_data* node_1_mics[3] = {&mic_data[2], &mic_data[3], &mic_data[4]};
+    float node1_buffer[MIC_BUFFER_LEN] = {0};
+    pthread_mutex_t node_1_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t node_1_cond = PTHREAD_COND_INITIALIZER;
+    node_1.mics = node_1_mics;
+    node_1.buffer = node1_buffer;
+    node_1.data_ready = 0;
+    node_1.num_mics = 3;
+    node_1.mutex = &node_1_mutex;
+    node_1.cond = &node_1_cond;
 
-    mic_data[3].buffer = mic4_buffer;
-    mic_data[3].device = mic_chs[3];
-    mic_data[3].updated = &mic_updates[3];
-    mic_data[3].mutex = &mic4_mutex;
-
-    mic_data[4].buffer = mic5_buffer;
-    mic_data[4].device = mic_chs[4];
-    mic_data[4].updated = &mic_updates[4];
-    mic_data[4].mutex = &mic5_mutex;
+    // Create alias for the first two mics to keep node terminology consistent
+    struct mic_thread_data node_2 = mic_data[0];
+    struct mic_thread_data node_3 = mic_data[1];
 
     // Start threads ===================================================================================================
-
     pthread_t thread[NUM_THREADS];
     
     printf("Starting audio threads.\n");
@@ -396,13 +460,13 @@ int main() {
         num_mics_initialized++;
     }
 
-    // Initialize the local mic update fields
-    for (int i = 0; i < NUM_MICS; i++) {
-        mic_updates[i] = *mic_data[i].updated;
+    run_node_threads = 1;
+    if ((ret = pthread_create(&thread[NODE1_THREAD_ID], NULL, createNode, &node_1)) != 0) {
+        fprintf(stderr, "Error: failed to create node 1 thread. Code: %d", ret);
+        goto node_1_thread_fail;
     }
 
-
-    if ((ret = pthread_create(&thread[NUM_THREADS - 1], NULL, transcribe, &transcribe_data)) != 0) {
+    if ((ret = pthread_create(&thread[TRANSCRIPT_THREAD_ID], NULL, transcribe, &transcribe_data)) != 0) {
         fprintf(stderr, "Error: failed to create transcription thread. Code: %d", ret);
         goto transcribe_thread_fail;
     }
@@ -415,44 +479,58 @@ int main() {
         float speech_prob;
         OrtValue** outputs = NULL;
 
-        float rms1 = 0, rms2 = 0;
+        float rms[3] = {0};
 
         // Accessing mic data ==========================================================================================
 
-        // TODO: I am not sure if this method of accessing mic data is the best, maybe it should be processed in another
-        //  thread because of how many mics there are.
-        //  Maybe I should have a thread for combining mics 3-5 together and a thread that determines which node to use.
+        pthread_mutex_lock(node_1.mutex);
+        pthread_mutex_lock(node_2.mutex);
+        pthread_mutex_lock(node_3.mutex);
 
-        for (int i = 0; i < NUM_MICS; i++) {
-            pthread_mutex_lock(mic_data[i].mutex);
-        }
-
-        // TODO: I don't think that waiting for all five mics to be updated at the same time is necessary or smart.
-        for (int i = 0; i < NUM_MICS; i++) {
-            if (mic_updates[i] == *mic_data[i].updated) {
-                for (int j = 0; i < NUM_MICS; j++) {
-                    pthread_mutex_unlock(mic_data[j].mutex);
-                }
-                goto end_of_loop;
+        if (node_1.data_ready && node_2.data_ready && node_3.data_ready ) {
+            for (int i = 0; i < MIC_BUFFER_LEN; i++) {
+                rms[0] += node_1.buffer[i] * node_1.buffer[i];
+                rms[1] += node_2.buffer[i] * node_2.buffer[i];
+                rms[2] += node_3.buffer[i] * node_3.buffer[i];
             }
+
+            int highest_power = max(rms, 3);
+            switch (highest_power) {
+                case 0:
+                    memcpy(combined_buffer, node_1.buffer, MIC_BUFFER_LEN * sizeof(float));
+                    break;
+                case 1:
+                    memcpy(combined_buffer, node_2.buffer, MIC_BUFFER_LEN * sizeof(float));
+                    break;
+                case 2:
+                    memcpy(combined_buffer, node_3.buffer, MIC_BUFFER_LEN * sizeof(float));
+                    break;
+                default:
+                    break;
+            }
+
+            node_1.data_ready = 0;
+            node_2.data_ready = 0;
+            node_3.data_ready = 0;
+            pthread_cond_signal(node_1.cond);
+            pthread_cond_signal(node_2.cond);
+            pthread_cond_signal(node_3.cond);
+            pthread_mutex_unlock(node_1.mutex);
+            pthread_mutex_unlock(node_2.mutex);
+            pthread_mutex_unlock(node_3.mutex);
+        } else {
+            // Don't want to run transcription
+            pthread_mutex_unlock(node_1.mutex);
+            pthread_mutex_unlock(node_2.mutex);
+            pthread_mutex_unlock(node_3.mutex);
+            continue;
         }
 
-        // TODO: Combine the last three mics into a single stream using fft stuff.
-
-        for (int i = 0; i < MIC_BUFFER_LEN; i++) {
-            rms1 += mic_data[0].buffer[i] * mic_data[0].buffer[i];
-            rms2 += mic_data[1].buffer[i] * mic_data[1].buffer[i];
-        }
-        memcpy(combined_buffer, rms1 > rms2 ? mic_data[0].buffer : mic_data[1].buffer, MIC_BUFFER_LEN * sizeof(float));
-
-        for (int i = 0; i < NUM_MICS; i++) {
-            pthread_mutex_unlock(mic_data[i].mutex);
-        }
         // =============================================================================================================
 
 		speech_prob = getSpeechProb(&outputs, ort);
         if (speech_prob == -2.0f) { continue; }
-        if (speech_prob == -1.0f) { goto end_of_loop; }
+        if (speech_prob == -1.0f) { goto clean_up_loop; }
         
         if (speech_prob > peak_value) { // increase
             peak_value = speech_prob;
@@ -494,25 +572,27 @@ int main() {
             peak_value = 0.0;
         }
         
-        // Cleanup iteration
 clean_up_loop:
         ort->ReleaseValue(outputs[0]);
         ort->ReleaseValue(vad_state_tensor);
         vad_state_tensor = outputs[1];
         outputs[1] = NULL;
-end_of_loop:
 	}
 	
 // Cleanup for program exit ------------------------------------------------------------------------
-transcribe_thread_fail:
+node_1_thread_fail:
+    run_node_threads = 0;
     pthread_join(thread[NUM_THREADS - 1], NULL);
+
+transcribe_thread_fail:
+    pthread_join(thread[NUM_THREADS - 2], NULL);
 
 mic_threads_fail:
     run_mic_threads = 0;
     for (int i = 0; i < num_mics_initialized; i++) {
         fprintf(stdout, "Cleaning up mic %d", i + 1);
         pthread_join(thread[i], NULL);
-        close_mic(mic_ch_list[i]);
+        close_mic(mic_chs[i]);
     }
 
     keep_running = 0;
