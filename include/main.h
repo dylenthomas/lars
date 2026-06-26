@@ -12,7 +12,6 @@
 #include "onnxruntime_c_api.h"
 #include "mic_access.h"
 #include "sherpa-onnx/c-api/c-api.h"
-#include "fft.h"
 
 // Mic characteristics
 #define MIC_BUFFER_LEN 512
@@ -92,7 +91,7 @@ struct mic_thread_data {
 };
 
 struct node_thread_data {
-    struct mic_thread_data** mics;
+    struct mic_thread_data** mics; // The mic in the first index is the origin of the node
     float* buffer;
     int data_ready;
     int num_mics;

@@ -1,11 +1,6 @@
 #ifndef FFT_H_
 #define FFT_H_
 
-#include <assert.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-
 typedef struct{double Re; double Im;} complex;
 
 #ifndef PI

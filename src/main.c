@@ -1,15 +1,15 @@
 #include "main.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <math.h>
 #include <pthread.h>
-#include <time.h>
 #include <signal.h>
+#include <string.h>
 
 #include "onnxruntime_c_api.h"
 #include "mic_access.h"
 #include "sherpa-onnx/c-api/c-api.h"
+#include "fft.h"
 
 // =====================================================================================================================
 // - 1 Corinthians 10:31
@@ -172,12 +172,65 @@ static void* createNode(void* ptr) {
         if (num_ready != args->num_mics) {
             unlockMicMutexes(args->mics, args->num_mics);
         } else {
-            // TODO: Combine the microphones, try something other than delay and combine
+            complex other[MIC_BUFFER_LEN];
+            complex origin[MIC_BUFFER_LEN];
+            complex combined[MIC_BUFFER_LEN];
+            complex tmp[MIC_BUFFER_LEN];
+            memset(args->buffer, 0, MIC_BUFFER_LEN * sizeof(float));
+            float rms[args->num_mics];
+
+            // Find the mic with the highest power and set that as the origin
+            for (int i = 0; i < args->num_mics; i++) {
+                for (int j = 0; j < MIC_BUFFER_LEN; j++) {
+                    rms[i] += args->mics[i]->buffer[j] * args->mics[i]->buffer[j];
+                }
+            }
+            const int origin_mic = max(rms, args->num_mics);
+
+            // Add the origin mic to the empty buffer
+            for (int i = 0; i < MIC_BUFFER_LEN; i++) {
+                args->buffer[i] = args->mics[origin_mic]->buffer[i];
+            }
+
+            for (int i = 0; i < MIC_BUFFER_LEN; i++) {
+                origin[i].Re = args->mics[0]->buffer[i];
+                origin[i].Im = 0.0f;
+            }
+            fft(origin, MIC_BUFFER_LEN, tmp);
+
+            for (int i = 1; i < args->num_mics; i++) {
+                if (i == origin_mic) { continue; }
+
+                for (int j = 0; j < MIC_BUFFER_LEN; j++) {
+                    other[j].Re = args->mics[i]->buffer[j];
+                    other[j].Im = 0.0f;
+                }
+                const int delay = findSampleDelay(args->mics[i]->buffer, args->mics[origin_mic]->buffer);
+                fft(other, MIC_BUFFER_LEN, tmp);
+
+                // shift the other microphone so it is temporally synched with the origin mic
+                for (int k = 0; k < MIC_BUFFER_LEN; k++) {
+                    const double shift_angle = -2 * PI * k * delay/MIC_BUFFER_LEN;
+                    complex other_shifted;
+
+                    other_shifted.Re = other[k].Re * cos(shift_angle) - other[k].Im * sin(shift_angle);
+                    other_shifted.Im = other[k].Re * sin(shift_angle) + other[k].Im * cos(shift_angle);
+
+                    combined[k].Re = (origin[k].Re + other_shifted.Re) * 0.5f;
+                    combined[k].Im = (origin[k].Im + other_shifted.Im) * 0.5f;
+                }
+
+                // Sum all mic data into a single buffer once its synced with the origin
+                ifft(combined, MIC_BUFFER_LEN, tmp);
+                for (int j = 0; j < MIC_BUFFER_LEN; j++) {
+                    args->buffer[j] += (float) combined[j].Re / MIC_BUFFER_LEN;
+                }
+            }
+
             args->data_ready = 1;
             unlockMicMutexes(args->mics, args->num_mics);
         }
     }
-
     return NULL;
 }
 
