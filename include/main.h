@@ -12,6 +12,7 @@
 #include "onnxruntime_c_api.h"
 #include "mic_access.h"
 #include "sherpa-onnx/c-api/c-api.h"
+#include "fft.h"
 
 // Mic characteristics
 #define MIC_BUFFER_LEN 512
@@ -189,6 +190,6 @@ static int max(const float values[], int num_vals);
  */
 static int initalizeSherpa();
 
-static int findSampleDelay(const float* ref_buffer, const float* other_buffer);
+static int findSampleDelay(const complex origin[MIC_BUFFER_LEN], const complex other[MIC_BUFFER_LEN]);
 
 #endif //LARS_MAIN_H

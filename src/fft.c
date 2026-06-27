@@ -69,21 +69,20 @@ void fft(complex* v, const int n, complex* tmp) {
    [8]   Let v[m] = ve[m] + w*vo[m]
    [9]   Let v[m+N/2] = ve[m] - w*vo[m]
  */
-void ifft(complex* v, int n, complex* tmp) {
+void ifft(complex* v, const int n, complex* tmp) {
     if(n > 1) {			/* otherwise, do nothing and return */
-        int k,m;    
-        complex z, w, *vo, *ve;
+        complex z, w;
 
-        ve = tmp; 
-        vo = tmp + n/2;
-        for(k = 0; k < n/2; k++) {
+        complex* ve = tmp;
+        complex* vo = tmp + n/2;
+        for(int k = 0; k < n/2; k++) {
             ve[k] = v[2 * k];
             vo[k] = v[2 * k + 1];
         }
     
         ifft(ve, n/2, v);		/* FFT on even-indexed elements of v[] */
         ifft(vo, n/2, v);		/* FFT on odd-indexed elements of v[] */
-        for(m = 0; m < n/2; m++) {
+        for(int m = 0; m < n/2; m++) {
             w.Re = cos(2 * PI * m/(double)n);
             w.Im = sin(2 * PI * m/(double)n);
             z.Re = w.Re * vo[m].Re - w.Im * vo[m].Im;	/* Re(w*vo[m]) */

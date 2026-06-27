@@ -154,86 +154,6 @@ static void unlockMicMutexes(struct mic_thread_data* mics[], const int num_mics)
     }
 }
 
-static void* createNode(void* ptr) {
-    struct node_thread_data* args = ptr;
-
-    while (run_node_threads) {
-        pthread_mutex_lock(args->mutex);
-        while (args->data_ready) {
-            pthread_cond_wait(args->cond, args->mutex);
-        }
-        pthread_mutex_unlock(args->mutex);
-
-        int num_ready = 0;
-        for (int i = 0; i < args->num_mics; i++) {
-            pthread_mutex_lock(args->mics[i]->mutex);
-            num_ready += args->mics[i]->data_ready;
-        }
-        if (num_ready != args->num_mics) {
-            unlockMicMutexes(args->mics, args->num_mics);
-        } else {
-            complex other[MIC_BUFFER_LEN];
-            complex origin[MIC_BUFFER_LEN];
-            complex combined[MIC_BUFFER_LEN];
-            complex tmp[MIC_BUFFER_LEN];
-            memset(args->buffer, 0, MIC_BUFFER_LEN * sizeof(float));
-            float rms[args->num_mics];
-
-            // Find the mic with the highest power and set that as the origin
-            for (int i = 0; i < args->num_mics; i++) {
-                for (int j = 0; j < MIC_BUFFER_LEN; j++) {
-                    rms[i] += args->mics[i]->buffer[j] * args->mics[i]->buffer[j];
-                }
-            }
-            const int origin_mic = max(rms, args->num_mics);
-
-            // Add the origin mic to the empty buffer
-            for (int i = 0; i < MIC_BUFFER_LEN; i++) {
-                args->buffer[i] = args->mics[origin_mic]->buffer[i];
-            }
-
-            for (int i = 0; i < MIC_BUFFER_LEN; i++) {
-                origin[i].Re = args->mics[0]->buffer[i];
-                origin[i].Im = 0.0f;
-            }
-            fft(origin, MIC_BUFFER_LEN, tmp);
-
-            for (int i = 1; i < args->num_mics; i++) {
-                if (i == origin_mic) { continue; }
-
-                for (int j = 0; j < MIC_BUFFER_LEN; j++) {
-                    other[j].Re = args->mics[i]->buffer[j];
-                    other[j].Im = 0.0f;
-                }
-                const int delay = findSampleDelay(args->mics[i]->buffer, args->mics[origin_mic]->buffer);
-                fft(other, MIC_BUFFER_LEN, tmp);
-
-                // shift the other microphone so it is temporally synched with the origin mic
-                for (int k = 0; k < MIC_BUFFER_LEN; k++) {
-                    const double shift_angle = -2 * PI * k * delay/MIC_BUFFER_LEN;
-                    complex other_shifted;
-
-                    other_shifted.Re = other[k].Re * cos(shift_angle) - other[k].Im * sin(shift_angle);
-                    other_shifted.Im = other[k].Re * sin(shift_angle) + other[k].Im * cos(shift_angle);
-
-                    combined[k].Re = (origin[k].Re + other_shifted.Re) * 0.5f;
-                    combined[k].Im = (origin[k].Im + other_shifted.Im) * 0.5f;
-                }
-
-                // Sum all mic data into a single buffer once its synced with the origin
-                ifft(combined, MIC_BUFFER_LEN, tmp);
-                for (int j = 0; j < MIC_BUFFER_LEN; j++) {
-                    args->buffer[j] += (float) combined[j].Re / MIC_BUFFER_LEN;
-                }
-            }
-
-            args->data_ready = 1;
-            unlockMicMutexes(args->mics, args->num_mics);
-        }
-    }
-    return NULL;
-}
-
 static int max(const float values[], const int num_vals) {
     int max_loc = 0;
     float max_val = -INFINITY;
@@ -316,35 +236,23 @@ static void* transcribe(void* ptr) {
     return NULL;
 }
 
-static int findSampleDelay(const float* ref_buffer, const float* other_buffer) {
+static int findSampleDelay(const complex origin[MIC_BUFFER_LEN], const complex other[MIC_BUFFER_LEN]) {
     // Find sample delay using frequency domain formula
     int i = 0;
     const int n = MIC_BUFFER_LEN;
     int m_delay = 0;
 
-    complex x[n], y[n], tmp[n], Rxy[n];
-
-    while (i < n) {
-        x[i].Re = ref_buffer[i];
-        x[i].Im = 0.0f;
-        y[i].Re = other_buffer[i];
-        y[i].Im = 0.0f;
-
-        i++;
-    }
-
-    fft(x, n, tmp);
-    fft(y, n, tmp);
+    complex tmp[n], Rxy[n];
 
     i = 0;
     while (i < n) {
         // compute correlation
-        // the total fomula is the dot product between x and complex conjugate of y
+        // the total formula is the dot product between x and complex conjugate of y
         //  normalized by the magnitude
-        const double a = x[i].Re;
-        const double b = x[i].Im;
-        const double c = y[i].Re;
-        const double d = y[i].Im;
+        const double a = origin[i].Re;
+        const double b = origin[i].Im;
+        const double c = other[i].Re;
+        const double d = other[i].Im;
 
         const double m1 = pow(a*c + b*d, 2);
         const double m2 = pow(b*c - a*d, 2);
@@ -369,6 +277,80 @@ static int findSampleDelay(const float* ref_buffer, const float* other_buffer) {
     }
 
     return (m_delay > n/2) ? m_delay - n : m_delay;
+}
+
+static void* createNode(void* ptr) {
+    struct node_thread_data* args = ptr;
+
+    while (run_node_threads) {
+        pthread_mutex_lock(args->mutex);
+        while (args->data_ready) {
+            pthread_cond_wait(args->cond, args->mutex);
+        }
+        pthread_mutex_unlock(args->mutex);
+
+        int num_ready = 0;
+        for (int i = 0; i < args->num_mics; i++) {
+            pthread_mutex_lock(args->mics[i]->mutex);
+            num_ready += args->mics[i]->data_ready;
+        }
+        if (num_ready != args->num_mics) {
+            unlockMicMutexes(args->mics, args->num_mics);
+        } else {
+            complex other[MIC_BUFFER_LEN];
+            complex origin[MIC_BUFFER_LEN];
+            complex combined[MIC_BUFFER_LEN];
+            complex tmp[MIC_BUFFER_LEN];
+            float rms[args->num_mics];
+
+            memset(rms, 0, sizeof(rms));
+            // Find the mic with the highest power and set that as the origin
+            for (int i = 0; i < args->num_mics; i++) {
+                for (int j = 0; j < MIC_BUFFER_LEN; j++) {
+                    rms[i] += args->mics[i]->buffer[j] * args->mics[i]->buffer[j];
+                }
+            }
+            const int origin_mic = max(rms, args->num_mics);
+
+            for (int i = 0; i < MIC_BUFFER_LEN; i++) {
+                origin[i].Re = args->mics[origin_mic]->buffer[i];
+                origin[i].Im = 0.0f;
+            }
+            fft(origin, MIC_BUFFER_LEN, tmp);
+            memcpy(combined, origin, sizeof(origin)); // Start off by setting the combined buffer to the origin
+
+            for (int i = 0; i < args->num_mics; i++) {
+                if (i == origin_mic) { continue; }
+
+                for (int j = 0; j < MIC_BUFFER_LEN; j++) {
+                    other[j].Re = args->mics[i]->buffer[j];
+                    other[j].Im = 0.0f;
+                }
+                fft(other, MIC_BUFFER_LEN, tmp);
+                const int delay = findSampleDelay(origin, other);
+
+                // shift the other microphone so it is temporally synced with the origin mic
+                for (int k = 0; k < MIC_BUFFER_LEN; k++) {
+                    const double shift_angle = -2 * PI * k * delay/MIC_BUFFER_LEN;
+                    combined[k].Re += other[k].Re * cos(shift_angle) - other[k].Im * sin(shift_angle);
+                    combined[k].Im += other[k].Re * sin(shift_angle) + other[k].Im * cos(shift_angle);
+                }
+            }
+
+            // Sum all mic data into a single buffer once its synced with the origin
+            pthread_mutex_lock(args->mutex);
+            ifft(combined, MIC_BUFFER_LEN, tmp);
+            memset(args->buffer, 0, MIC_BUFFER_LEN * sizeof(float));
+            for (int j = 0; j < MIC_BUFFER_LEN; j++) {
+                args->buffer[j] += (float) (combined[j].Re / MIC_BUFFER_LEN / args->num_mics);
+            }
+            args->data_ready = 1;
+            for (int i = 0; i < args->num_mics; i++) { args->mics[i]->data_ready = 0; }
+            unlockMicMutexes(args->mics, args->num_mics);
+            pthread_mutex_unlock(args->mutex);
+        }
+    }
+    return NULL;
 }
 
 static int initializeSherpa() {
@@ -494,8 +476,8 @@ int main() {
     node_1.cond = &node_1_cond;
 
     // Create alias for the first two mics to keep node terminology consistent
-    struct mic_thread_data node_2 = mic_data[0];
-    struct mic_thread_data node_3 = mic_data[1];
+    struct mic_thread_data* node_2 = &mic_data[0];
+    struct mic_thread_data* node_3 = &mic_data[1];
 
     // Start threads ===================================================================================================
     pthread_t thread[NUM_THREADS];
@@ -510,6 +492,7 @@ int main() {
             goto mic_threads_fail;
         }
 
+        fprintf(stdout, "Started mic %d\n", num_mics_initialized);
         num_mics_initialized++;
     }
 
@@ -518,11 +501,13 @@ int main() {
         fprintf(stderr, "Error: failed to create node 1 thread. Code: %d", ret);
         goto node_1_thread_fail;
     }
+    fprintf(stdout, "Started node 1 thread\n");
 
     if ((ret = pthread_create(&thread[TRANSCRIPT_THREAD_ID], NULL, transcribe, &transcribe_data)) != 0) {
         fprintf(stderr, "Error: failed to create transcription thread. Code: %d", ret);
         goto transcribe_thread_fail;
     }
+    fprintf(stdout, "Started transcription thread\n");
 
     // Main Loop =======================================================================================================
     while (keep_running) {
@@ -537,14 +522,16 @@ int main() {
         // Accessing mic data ==========================================================================================
 
         pthread_mutex_lock(node_1.mutex);
-        pthread_mutex_lock(node_2.mutex);
-        pthread_mutex_lock(node_3.mutex);
+        pthread_mutex_lock(node_2->mutex);
+        pthread_mutex_lock(node_3->mutex);
 
-        if (node_1.data_ready && node_2.data_ready && node_3.data_ready ) {
+        fprintf(stdout, "node 1: %d, node 2: %d, node 3: %d\n", node_1.data_ready, node_2->data_ready, node_3->data_ready);
+
+        if (node_1.data_ready && node_2->data_ready && node_3->data_ready ) {
             for (int i = 0; i < MIC_BUFFER_LEN; i++) {
                 rms[0] += node_1.buffer[i] * node_1.buffer[i];
-                rms[1] += node_2.buffer[i] * node_2.buffer[i];
-                rms[2] += node_3.buffer[i] * node_3.buffer[i];
+                rms[1] += node_2->buffer[i] * node_2->buffer[i];
+                rms[2] += node_3->buffer[i] * node_3->buffer[i];
             }
 
             int highest_power = max(rms, 3);
@@ -553,29 +540,29 @@ int main() {
                     memcpy(combined_buffer, node_1.buffer, MIC_BUFFER_LEN * sizeof(float));
                     break;
                 case 1:
-                    memcpy(combined_buffer, node_2.buffer, MIC_BUFFER_LEN * sizeof(float));
+                    memcpy(combined_buffer, node_2->buffer, MIC_BUFFER_LEN * sizeof(float));
                     break;
                 case 2:
-                    memcpy(combined_buffer, node_3.buffer, MIC_BUFFER_LEN * sizeof(float));
+                    memcpy(combined_buffer, node_3->buffer, MIC_BUFFER_LEN * sizeof(float));
                     break;
                 default:
                     break;
             }
 
             node_1.data_ready = 0;
-            node_2.data_ready = 0;
-            node_3.data_ready = 0;
+            node_2->data_ready = 0;
+            node_3->data_ready = 0;
             pthread_cond_signal(node_1.cond);
-            pthread_cond_signal(node_2.cond);
-            pthread_cond_signal(node_3.cond);
+            pthread_cond_signal(node_2->cond);
+            pthread_cond_signal(node_3->cond);
             pthread_mutex_unlock(node_1.mutex);
-            pthread_mutex_unlock(node_2.mutex);
-            pthread_mutex_unlock(node_3.mutex);
+            pthread_mutex_unlock(node_2->mutex);
+            pthread_mutex_unlock(node_3->mutex);
         } else {
             // Don't want to run transcription
             pthread_mutex_unlock(node_1.mutex);
-            pthread_mutex_unlock(node_2.mutex);
-            pthread_mutex_unlock(node_3.mutex);
+            pthread_mutex_unlock(node_2->mutex);
+            pthread_mutex_unlock(node_3->mutex);
             continue;
         }
 
