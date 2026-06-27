@@ -84,34 +84,34 @@ const SherpaOnnxOnlineSpeechDenoiser* sd;
 void intHandler(int dummy);
 
 struct mic_thread_data {
-    float* buffer;
     snd_pcm_t* device;
-    int data_ready;
     pthread_mutex_t* mutex;
     pthread_cond_t* cond;
+    int data_ready;
+    float* buffer;
 };
 
+struct mic_thread_data mic_data[NUM_MICS];
+
 struct node_thread_data {
-    struct mic_thread_data** mics; // The mic in the first index is the origin of the node
+    pthread_mutex_t* mutex;
+    pthread_cond_t* cond;
     float* buffer;
     int data_ready;
     int num_mics;
-    pthread_mutex_t* mutex;
-    pthread_cond_t* cond;
+    int* mic_indexes; // Each entry represents the correct index in the mic_data array
 };
 
 struct transcribe_thread_data {
     const SherpaOnnxOnlineRecognizer* recognizer;
     const SherpaOnnxOnlineStream* stream;
     const SherpaOnnxOnlineSpeechDenoiser* denoiser;
-
-    int ready;
-    float audio[MIC_BUFFER_LEN];
-    int flush;
-    float chance_of_speech;
-
     pthread_mutex_t* mutex;
     pthread_cond_t* cond;
+    float audio[MIC_BUFFER_LEN];
+    float chance_of_speech;
+    int ready;
+    int flush;
 };
 
 static atomic_int run_mic_threads = 0;

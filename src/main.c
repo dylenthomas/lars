@@ -5,6 +5,8 @@
 #include <pthread.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 #include "onnxruntime_c_api.h"
 #include "mic_access.h"
@@ -20,8 +22,10 @@
 
 // TODO: Consider the scenario where a mic is not updating for multiple iterations and how to handle that
 
-void intHandler(int dummy) {
-    keep_running = 0;
+int kbhit(void) {
+    int k;
+    ioctl(STDIN_FILENO, FIONREAD, &k);
+    return k;
 }
 
 static int badStatus(OrtStatus* status, const OrtApi* ort) {
@@ -136,9 +140,8 @@ static void* readMicData(void* ptr) {
 
         int16_t tmp_buffer[MIC_BUFFER_LEN] = {0};
 	    int i = 0;
-
         read_mic(tmp_buffer, args->device, MIC_BUFFER_LEN);
-        // convert int mic data to float	
+
         pthread_mutex_lock(args->mutex);
 	    while (i < MIC_BUFFER_LEN) { args->buffer[i] = (float)tmp_buffer[i] / 32768.0f; i++; }
         args->data_ready = 1;
@@ -146,12 +149,6 @@ static void* readMicData(void* ptr) {
     }
 
     return NULL;
-}
-
-static void unlockMicMutexes(struct mic_thread_data* mics[], const int num_mics) {
-    for (int i = 0; i < num_mics; i++) {
-        pthread_mutex_unlock(mics[i]->mutex);
-    }
 }
 
 static int max(const float values[], const int num_vals) {
@@ -291,11 +288,17 @@ static void* createNode(void* ptr) {
 
         int num_ready = 0;
         for (int i = 0; i < args->num_mics; i++) {
-            pthread_mutex_lock(args->mics[i]->mutex);
-            num_ready += args->mics[i]->data_ready;
+            int mi = args->mic_indexes[i];
+            pthread_mutex_lock(mic_data[mi].mutex);
+            num_ready += mic_data[mi].data_ready;
         }
+
         if (num_ready != args->num_mics) {
-            unlockMicMutexes(args->mics, args->num_mics);
+            for (int i = 0; i < args->num_mics; i++) {
+                int mi = args->mic_indexes[i];
+                pthread_mutex_unlock(mic_data[mi].mutex);
+            }
+            usleep(1000); // Give the mic threads a chance to update the data
         } else {
             complex other[MIC_BUFFER_LEN];
             complex origin[MIC_BUFFER_LEN];
@@ -306,24 +309,29 @@ static void* createNode(void* ptr) {
             memset(rms, 0, sizeof(rms));
             // Find the mic with the highest power and set that as the origin
             for (int i = 0; i < args->num_mics; i++) {
+                int mi = args->mic_indexes[i];
                 for (int j = 0; j < MIC_BUFFER_LEN; j++) {
-                    rms[i] += args->mics[i]->buffer[j] * args->mics[i]->buffer[j];
+                    rms[i] += mic_data[mi].buffer[j] * mic_data[mi].buffer[j];
                 }
             }
             const int origin_mic = max(rms, args->num_mics);
 
+            fprintf(stdout, "origin_mic = %d\n", origin_mic);
+
             for (int i = 0; i < MIC_BUFFER_LEN; i++) {
-                origin[i].Re = args->mics[origin_mic]->buffer[i];
+                origin[i].Re = mic_data[origin_mic].buffer[i];
                 origin[i].Im = 0.0f;
             }
+
             fft(origin, MIC_BUFFER_LEN, tmp);
             memcpy(combined, origin, sizeof(origin)); // Start off by setting the combined buffer to the origin
 
             for (int i = 0; i < args->num_mics; i++) {
                 if (i == origin_mic) { continue; }
+                int mi = args->mic_indexes[i];
 
                 for (int j = 0; j < MIC_BUFFER_LEN; j++) {
-                    other[j].Re = args->mics[i]->buffer[j];
+                    other[j].Re = mic_data[mi].buffer[j];
                     other[j].Im = 0.0f;
                 }
                 fft(other, MIC_BUFFER_LEN, tmp);
@@ -337,16 +345,24 @@ static void* createNode(void* ptr) {
                 }
             }
 
-            // Sum all mic data into a single buffer once its synced with the origin
-            pthread_mutex_lock(args->mutex);
+            fprintf(stdout, "Combined all FFT signals\n");
+
             ifft(combined, MIC_BUFFER_LEN, tmp);
+            pthread_mutex_lock(args->mutex);
             memset(args->buffer, 0, MIC_BUFFER_LEN * sizeof(float));
             for (int j = 0; j < MIC_BUFFER_LEN; j++) {
                 args->buffer[j] += (float) (combined[j].Re / MIC_BUFFER_LEN / args->num_mics);
             }
             args->data_ready = 1;
-            for (int i = 0; i < args->num_mics; i++) { args->mics[i]->data_ready = 0; }
-            unlockMicMutexes(args->mics, args->num_mics);
+            
+            fprintf(stdout, "Set data_ready\n");
+
+            for (int i = 0; i < args->num_mics; i++) { 
+                int mi = args->mic_indexes[i];
+                mic_data[mi].data_ready = 0;
+                pthread_cond_signal(mic_data[mi].cond);
+                pthread_mutex_unlock(mic_data[mi].mutex);
+            }
             pthread_mutex_unlock(args->mutex);
         }
     }
@@ -397,8 +413,6 @@ static int initializeSherpa() {
 }
 
 int main() {
-    signal(SIGINT, intHandler); // Allow safe exit from program with Ctrl-C
-
     double peak_value = 0.0;
     int iterations_held = 0;
     int iterations_decayed = 0;
@@ -434,7 +448,6 @@ int main() {
     transcribe_data.mutex = &transcribe_mutex;
     transcribe_data.ready = 0;
 
-    struct mic_thread_data mic_data[NUM_MICS];
     float mic1_buffer[MIC_BUFFER_LEN] = {0};
     float mic2_buffer[MIC_BUFFER_LEN] = {0};
     float mic3_buffer[MIC_BUFFER_LEN] = {0};
@@ -464,11 +477,11 @@ int main() {
     }
 
     struct node_thread_data node_1;
-    struct mic_thread_data* node_1_mics[3] = {&mic_data[2], &mic_data[3], &mic_data[4]};
+    int mic_indexes[3] = {2, 3, 4};
     float node1_buffer[MIC_BUFFER_LEN] = {0};
     pthread_mutex_t node_1_mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t node_1_cond = PTHREAD_COND_INITIALIZER;
-    node_1.mics = node_1_mics;
+    node_1.mic_indexes = mic_indexes;
     node_1.buffer = node1_buffer;
     node_1.data_ready = 0;
     node_1.num_mics = 3;
@@ -484,7 +497,6 @@ int main() {
     
     printf("Starting audio threads.\n");
     run_mic_threads = 1;
-
     int num_mics_initialized = 0;
     while (num_mics_initialized < NUM_MICS) {
         if ((ret = pthread_create(&thread[num_mics_initialized], NULL, readMicData, &mic_data[num_mics_initialized])) != 0) {
@@ -510,7 +522,7 @@ int main() {
     fprintf(stdout, "Started transcription thread\n");
 
     // Main Loop =======================================================================================================
-    while (keep_running) {
+    while (!kbhit()) {
         int hold_iterations = 5;
         const double speech_threshold = 0.7; // trigger threshold to start transcription
 
@@ -524,10 +536,18 @@ int main() {
         pthread_mutex_lock(node_1.mutex);
         pthread_mutex_lock(node_2->mutex);
         pthread_mutex_lock(node_3->mutex);
-
-        fprintf(stdout, "node 1: %d, node 2: %d, node 3: %d\n", node_1.data_ready, node_2->data_ready, node_3->data_ready);
-
-        if (node_1.data_ready && node_2->data_ready && node_3->data_ready ) {
+        
+        pthread_mutex_lock(mic_data[2].mutex);
+        pthread_mutex_lock(mic_data[3].mutex);
+        pthread_mutex_lock(mic_data[4].mutex);
+        fprintf(stdout, "mic1: %d, mic2: %d, node1: %d, mic3: %d, mic4: %d, mic5: %d\n",
+                node_2->data_ready, node_3->data_ready, node_1.data_ready, mic_data[2].data_ready, mic_data[3].data_ready, mic_data[4].data_ready
+        );
+        pthread_mutex_unlock(mic_data[4].mutex);
+        pthread_mutex_unlock(mic_data[3].mutex);
+        pthread_mutex_unlock(mic_data[2].mutex);
+        
+        if (node_1.data_ready && node_2->data_ready && node_3->data_ready) {
             for (int i = 0; i < MIC_BUFFER_LEN; i++) {
                 rms[0] += node_1.buffer[i] * node_1.buffer[i];
                 rms[1] += node_2->buffer[i] * node_2->buffer[i];
@@ -563,6 +583,7 @@ int main() {
             pthread_mutex_unlock(node_1.mutex);
             pthread_mutex_unlock(node_2->mutex);
             pthread_mutex_unlock(node_3->mutex);
+            usleep(1000);
             continue;
         }
 

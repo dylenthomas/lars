@@ -4,7 +4,7 @@
 
 void checkErr(int err) {
 	if (err < 0) {
-		fprintf(stderr, "Error!, %s\n", snd_strerror(err));
+		fprintf(stderr, "Error %d, %s\n", err, snd_strerror(err));
 		exit(1);
 	}
 }
