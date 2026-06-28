@@ -471,7 +471,7 @@ int main() {
     float* mic_buffers[NUM_MICS] = {mic1_buffer, mic2_buffer, mic3_buffer, mic4_buffer, mic5_buffer};
     pthread_mutex_t* mic_mutexes[NUM_MICS] = {&mic1_mutex, &mic2_mutex, &mic3_mutex, &mic4_mutex, &mic5_mutex};
     pthread_cond_t* mic_conds[NUM_MICS] = {&mic1_cond, &mic2_cond, &mic3_cond, &mic4_cond, &mic5_cond};
-    float mic_gains[NUM_MICS] = {1.25f, 1.25f, 50.0f, 50.0f, 50.0f};
+    float mic_gains[NUM_MICS] = {1.25f, 1.25f, 10.0f, 10.0f, 10.0f};
 
     for (int i = 0; i < NUM_MICS; i++) {
         mic_data[i].buffer = mic_buffers[i];
@@ -556,6 +556,7 @@ int main() {
         */ 
 
         if (node_1.data_ready && node_2->data_ready && node_3->data_ready) {
+            /*
             for (int i = 0; i < MIC_BUFFER_LEN; i++) {
                 rms[0] += node_1.buffer[i] * node_1.buffer[i];
                 rms[1] += node_2->buffer[i] * node_2->buffer[i];
@@ -576,6 +577,10 @@ int main() {
                     break;
                 default:
                     break;
+            }*/
+
+            for (int i = 0; i < MIC_BUFFER_LEN; i++)  {
+                combined_buffer[i] = node_1.buffer[i] + node_2->buffer[i] - node_3->buffer[i];
             }
 
             node_1.data_ready = 0;
