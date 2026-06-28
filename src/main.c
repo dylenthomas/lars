@@ -130,7 +130,6 @@ static float getSpeechProb(OrtValue*** outputs, const OrtApi* ort) {
 
 static void* readMicData(void* ptr) {
     struct mic_thread_data* args = ptr;
-    const float gain = 1.25f;
 
     while (run_mic_threads) {
         pthread_mutex_lock(args->mutex);
@@ -144,7 +143,7 @@ static void* readMicData(void* ptr) {
 
         pthread_mutex_lock(args->mutex);
 	    for (int i = 0; i < MIC_BUFFER_LEN; i++) { 
-            float sample = (float)tmp_buffer[i] / 32768.0f * gain; 
+            float sample = (float)tmp_buffer[i] / 32768.0f * args->gain; 
             if (sample > 1.0f) sample = 1.0f;
             else if (sample < -1.0f) sample = -1.0f;
             args->buffer[i] = sample;
@@ -342,12 +341,15 @@ static void* createNode(void* ptr) {
         memcpy(combined, origin, sizeof(origin)); // Start off by setting the combined buffer to the origin
 
         for (int i = 0; i < args->num_mics; i++) {
+            float other_rms = 0.0f;
             if (i == origin_mic) { continue; }
             
             for (int j = 0; j < MIC_BUFFER_LEN; j++) {
                 other[j].Re = local_bufs[i][j];
                 other[j].Im = 0.0f;
+                other_rms += local_bufs[i][j] * local_bufs[i][j];
             }
+
             fft(other, MIC_BUFFER_LEN, tmp);
             const int delay = findSampleDelay(origin, other);
 
@@ -358,12 +360,12 @@ static void* createNode(void* ptr) {
                 combined[k].Im += other[k].Re * sin(shift_angle) + other[k].Im * cos(shift_angle);
             }
         }
-
+        
         ifft(combined, MIC_BUFFER_LEN, tmp);
+
         pthread_mutex_lock(args->mutex);
-        memset(args->buffer, 0, MIC_BUFFER_LEN * sizeof(float));
         for (int j = 0; j < MIC_BUFFER_LEN; j++) {
-            args->buffer[j] += (float) (combined[j].Re / MIC_BUFFER_LEN / args->num_mics);
+            args->buffer[j] = (float) (combined[j].Re / MIC_BUFFER_LEN / args->num_mics);
         }
         args->data_ready = 1;
         pthread_mutex_unlock(args->mutex);
@@ -469,6 +471,7 @@ int main() {
     float* mic_buffers[NUM_MICS] = {mic1_buffer, mic2_buffer, mic3_buffer, mic4_buffer, mic5_buffer};
     pthread_mutex_t* mic_mutexes[NUM_MICS] = {&mic1_mutex, &mic2_mutex, &mic3_mutex, &mic4_mutex, &mic5_mutex};
     pthread_cond_t* mic_conds[NUM_MICS] = {&mic1_cond, &mic2_cond, &mic3_cond, &mic4_cond, &mic5_cond};
+    float mic_gains[NUM_MICS] = {1.25f, 1.25f, 50.0f, 50.0f, 50.0f};
 
     for (int i = 0; i < NUM_MICS; i++) {
         mic_data[i].buffer = mic_buffers[i];
@@ -476,6 +479,7 @@ int main() {
         mic_data[i].data_ready = 0;
         mic_data[i].mutex = mic_mutexes[i];
         mic_data[i].cond = mic_conds[i];
+        mic_data[i].gain = mic_gains[i];
     }
 
     struct node_thread_data node_1;
@@ -559,7 +563,7 @@ int main() {
             }
 
             const int highest_power = max(rms, 3);
-            printf("rms = [ %.3f, %.3f, %.3f]\n", rms[0], rms[1], rms[2]);
+            //printf("rms = [ %.3f, %.3f, %.3f]\n", rms[0], rms[1], rms[2]);
             switch (highest_power) {
                 case 0:
                     memcpy(combined_buffer, node_1.buffer, MIC_BUFFER_LEN * sizeof(float));

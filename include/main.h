@@ -89,6 +89,7 @@ struct mic_thread_data {
     pthread_cond_t* cond;
     int data_ready;
     float* buffer;
+    float gain;
 };
 
 struct mic_thread_data mic_data[NUM_MICS];
