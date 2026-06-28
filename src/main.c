@@ -130,6 +130,7 @@ static float getSpeechProb(OrtValue*** outputs, const OrtApi* ort) {
 
 static void* readMicData(void* ptr) {
     struct mic_thread_data* args = ptr;
+    const float gain = 1.25f;
 
     while (run_mic_threads) {
         pthread_mutex_lock(args->mutex);
@@ -139,11 +140,15 @@ static void* readMicData(void* ptr) {
         pthread_mutex_unlock(args->mutex);
 
         int16_t tmp_buffer[MIC_BUFFER_LEN] = {0};
-	    int i = 0;
         read_mic(tmp_buffer, args->device, MIC_BUFFER_LEN);
 
         pthread_mutex_lock(args->mutex);
-	    while (i < MIC_BUFFER_LEN) { args->buffer[i] = (float)tmp_buffer[i] / 32768.0f; i++; }
+	    for (int i = 0; i < MIC_BUFFER_LEN; i++) { 
+            float sample = (float)tmp_buffer[i] / 32768.0f * gain; 
+            if (sample > 1.0f) sample = 1.0f;
+            else if (sample < -1.0f) sample = -1.0f;
+            args->buffer[i] = sample;
+        }
         args->data_ready = 1;
         pthread_mutex_unlock(args->mutex);
     }
@@ -196,9 +201,10 @@ static void* transcribe(void* ptr) {
                 }
 
                 const SherpaOnnxOnlineRecognizerResult* r = SherpaOnnxGetOnlineStreamResult(recognizer, stream);
-                printf("\033[1A");
-                printf("\033[2K\r[%.2f] %s    \n", chance_of_speech, r->text);
-                fflush(stdout);
+                //printf("\033[1A");
+                //printf("\033[2K\r[%.2f] %s    \n", chance_of_speech, r->text);
+                //fflush(stdout);
+                printf("[%.2f] %s\n", chance_of_speech, r->text);
 
                 if (SherpaOnnxOnlineStreamIsEndpoint(recognizer, stream)) {
                     SherpaOnnxOnlineStreamReset(recognizer, stream);
@@ -220,9 +226,10 @@ static void* transcribe(void* ptr) {
             }
 
             const SherpaOnnxOnlineRecognizerResult* r = SherpaOnnxGetOnlineStreamResult(recognizer, stream);
-            printf("\033[1A");
-            printf("\033[2K\r[%.2f] %s    \n", chance_of_speech, r->text);
-            fflush(stdout);
+            //printf("\033[1A");
+            //printf("\033[2K\r[%.2f] %s    \n", chance_of_speech, r->text);
+            //fflush(stdout);
+            printf("[%.2f] %s\n", chance_of_speech, r->text);
 
             SherpaOnnxDestroyOnlineRecognizerResult(r);
             SherpaOnnxOnlineStreamReset(recognizer, stream);
@@ -299,72 +306,67 @@ static void* createNode(void* ptr) {
                 pthread_mutex_unlock(mic_data[mi].mutex);
             }
             usleep(1000); // Give the mic threads a chance to update the data
-        } else {
-            complex other[MIC_BUFFER_LEN];
-            complex origin[MIC_BUFFER_LEN];
-            complex combined[MIC_BUFFER_LEN];
-            complex tmp[MIC_BUFFER_LEN];
-            float rms[args->num_mics];
-
-            memset(rms, 0, sizeof(rms));
-            // Find the mic with the highest power and set that as the origin
-            for (int i = 0; i < args->num_mics; i++) {
-                int mi = args->mic_indexes[i];
-                for (int j = 0; j < MIC_BUFFER_LEN; j++) {
-                    rms[i] += mic_data[mi].buffer[j] * mic_data[mi].buffer[j];
-                }
-            }
-            const int origin_mic = max(rms, args->num_mics);
-
-            fprintf(stdout, "origin_mic = %d\n", origin_mic);
-
-            for (int i = 0; i < MIC_BUFFER_LEN; i++) {
-                origin[i].Re = mic_data[origin_mic].buffer[i];
-                origin[i].Im = 0.0f;
-            }
-
-            fft(origin, MIC_BUFFER_LEN, tmp);
-            memcpy(combined, origin, sizeof(origin)); // Start off by setting the combined buffer to the origin
-
-            for (int i = 0; i < args->num_mics; i++) {
-                if (i == origin_mic) { continue; }
-                int mi = args->mic_indexes[i];
-
-                for (int j = 0; j < MIC_BUFFER_LEN; j++) {
-                    other[j].Re = mic_data[mi].buffer[j];
-                    other[j].Im = 0.0f;
-                }
-                fft(other, MIC_BUFFER_LEN, tmp);
-                const int delay = findSampleDelay(origin, other);
-
-                // shift the other microphone so it is temporally synced with the origin mic
-                for (int k = 0; k < MIC_BUFFER_LEN; k++) {
-                    const double shift_angle = -2 * PI * k * delay/MIC_BUFFER_LEN;
-                    combined[k].Re += other[k].Re * cos(shift_angle) - other[k].Im * sin(shift_angle);
-                    combined[k].Im += other[k].Re * sin(shift_angle) + other[k].Im * cos(shift_angle);
-                }
-            }
-
-            fprintf(stdout, "Combined all FFT signals\n");
-
-            ifft(combined, MIC_BUFFER_LEN, tmp);
-            pthread_mutex_lock(args->mutex);
-            memset(args->buffer, 0, MIC_BUFFER_LEN * sizeof(float));
-            for (int j = 0; j < MIC_BUFFER_LEN; j++) {
-                args->buffer[j] += (float) (combined[j].Re / MIC_BUFFER_LEN / args->num_mics);
-            }
-            args->data_ready = 1;
-            
-            fprintf(stdout, "Set data_ready\n");
-
-            for (int i = 0; i < args->num_mics; i++) { 
-                int mi = args->mic_indexes[i];
-                mic_data[mi].data_ready = 0;
-                pthread_cond_signal(mic_data[mi].cond);
-                pthread_mutex_unlock(mic_data[mi].mutex);
-            }
-            pthread_mutex_unlock(args->mutex);
+            continue;
+        } 
+           
+        float local_bufs[args->num_mics][MIC_BUFFER_LEN];
+        for (int i = 0; i < args->num_mics; i++) {
+            int mi = args->mic_indexes[i];
+            memcpy(local_bufs[i], mic_data[mi].buffer, MIC_BUFFER_LEN * sizeof(float));
+            mic_data[mi].data_ready = 0;
+            pthread_cond_signal(mic_data[mi].cond);
+            pthread_mutex_unlock(mic_data[mi].mutex);
         }
+
+        complex other[MIC_BUFFER_LEN];
+        complex origin[MIC_BUFFER_LEN];
+        complex combined[MIC_BUFFER_LEN];
+        complex tmp[MIC_BUFFER_LEN];
+        float rms[args->num_mics];
+
+        memset(rms, 0, sizeof(rms));
+        // Find the mic with the highest power and set that as the origin
+        for (int i = 0; i < args->num_mics; i++) {
+            for (int j = 0; j < MIC_BUFFER_LEN; j++) {
+                rms[i] += local_bufs[i][j] * local_bufs[i][j];
+            }
+        }
+        const int origin_mic = max(rms, args->num_mics);
+
+        for (int i = 0; i < MIC_BUFFER_LEN; i++) {
+            origin[i].Re = local_bufs[origin_mic][i];
+            origin[i].Im = 0.0f;
+        }
+
+        fft(origin, MIC_BUFFER_LEN, tmp);
+        memcpy(combined, origin, sizeof(origin)); // Start off by setting the combined buffer to the origin
+
+        for (int i = 0; i < args->num_mics; i++) {
+            if (i == origin_mic) { continue; }
+            
+            for (int j = 0; j < MIC_BUFFER_LEN; j++) {
+                other[j].Re = local_bufs[i][j];
+                other[j].Im = 0.0f;
+            }
+            fft(other, MIC_BUFFER_LEN, tmp);
+            const int delay = findSampleDelay(origin, other);
+
+            // shift the other microphone so it is temporally synced with the origin mic
+            for (int k = 0; k < MIC_BUFFER_LEN; k++) {
+                const double shift_angle = -2 * PI * k * delay/MIC_BUFFER_LEN;
+                combined[k].Re += other[k].Re * cos(shift_angle) - other[k].Im * sin(shift_angle);
+                combined[k].Im += other[k].Re * sin(shift_angle) + other[k].Im * cos(shift_angle);
+            }
+        }
+
+        ifft(combined, MIC_BUFFER_LEN, tmp);
+        pthread_mutex_lock(args->mutex);
+        memset(args->buffer, 0, MIC_BUFFER_LEN * sizeof(float));
+        for (int j = 0; j < MIC_BUFFER_LEN; j++) {
+            args->buffer[j] += (float) (combined[j].Re / MIC_BUFFER_LEN / args->num_mics);
+        }
+        args->data_ready = 1;
+        pthread_mutex_unlock(args->mutex);
     }
     return NULL;
 }
@@ -536,7 +538,8 @@ int main() {
         pthread_mutex_lock(node_1.mutex);
         pthread_mutex_lock(node_2->mutex);
         pthread_mutex_lock(node_3->mutex);
-        
+       
+        /*
         pthread_mutex_lock(mic_data[2].mutex);
         pthread_mutex_lock(mic_data[3].mutex);
         pthread_mutex_lock(mic_data[4].mutex);
@@ -546,7 +549,8 @@ int main() {
         pthread_mutex_unlock(mic_data[4].mutex);
         pthread_mutex_unlock(mic_data[3].mutex);
         pthread_mutex_unlock(mic_data[2].mutex);
-        
+        */ 
+
         if (node_1.data_ready && node_2->data_ready && node_3->data_ready) {
             for (int i = 0; i < MIC_BUFFER_LEN; i++) {
                 rms[0] += node_1.buffer[i] * node_1.buffer[i];
@@ -554,7 +558,8 @@ int main() {
                 rms[2] += node_3->buffer[i] * node_3->buffer[i];
             }
 
-            int highest_power = max(rms, 3);
+            const int highest_power = max(rms, 3);
+            printf("rms = [ %.3f, %.3f, %.3f]\n", rms[0], rms[1], rms[2]);
             switch (highest_power) {
                 case 0:
                     memcpy(combined_buffer, node_1.buffer, MIC_BUFFER_LEN * sizeof(float));
