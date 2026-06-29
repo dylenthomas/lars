@@ -1,0 +1,13 @@
+lights
+mute
+unmute
+lights on
+lights off
+volume down
+volume up
+overhead lamp off
+overhead lamp on
+desk lights on
+desk lights off
+set aux audio
+set phono audio

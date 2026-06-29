@@ -1,7 +1,3 @@
-//
-// Created by dylenthomas on 2026-06-03.
-//
-
 #ifndef LARS_MAIN_H
 #define LARS_MAIN_H
 
@@ -81,8 +77,6 @@ const SherpaOnnxOnlineRecognizer* sherpa_recognizer;
 const SherpaOnnxOnlineStream* sherpa_stream;
 SherpaOnnxOnlineSpeechDenoiserConfig denoiser_config;
 const SherpaOnnxOnlineSpeechDenoiser* sd;
-
-void intHandler(int dummy);
 
 struct mic_thread_data {
     snd_pcm_t* device;

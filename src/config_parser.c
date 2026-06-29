@@ -7,6 +7,8 @@
  * Data structure is key : list in a single JSON object, for n keys
 */
 
+// TODO: Switch to text file based parsing using new lines (I don't know why I wanted to use JSON)
+
 // djb2 hash function from http://www.cse.yorku.ca/~oz/hash.html
 uint64_t djb2Hash(char* str) {
     uint64_t hash = 5381;

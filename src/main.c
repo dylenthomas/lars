@@ -12,6 +12,11 @@
 // - 1 Corinthians 10:31
 // =====================================================================================================================
 
+// TODO: Add a flush delay of a few seconds
+// TODO: Check if denoising ONLY node_1 (i.e., the close range microphones) after boosting their gain helps or harms accuracy
+// TODO: Clean up this file 
+// TODO: Start working on keyword identification
+
 // TODO: For communication with the RaspberryPi think about using mosquitto (or another MQTT tool)
 // TODO: On the RaspberryPi use pinctrl (or other similar cli) to control hardware states
 
@@ -168,8 +173,10 @@ static void* transcribe(void* ptr) {
     const SherpaOnnxOnlineRecognizer* recognizer = args->recognizer;
     const SherpaOnnxOnlineStream* stream = args->stream;
     const SherpaOnnxOnlineSpeechDenoiser* denoiser = args->denoiser;
+
+#define MAX_TIME 5
     
-    static float saved_audio[2 * SAMPLE_RATE] = {0};
+    static float saved_audio[MAX_TIME * SAMPLE_RATE] = {0};
     static int saved_samples = 0;
     static char wav_filename[64];
 
@@ -188,7 +195,7 @@ static void* transcribe(void* ptr) {
         chance_of_speech = args->chance_of_speech;
         pthread_mutex_unlock(args->mutex);
 
-        if (saved_samples == 2 * SAMPLE_RATE) {
+        if (saved_samples == MAX_TIME * SAMPLE_RATE) {
             make_wav_filename(wav_filename, sizeof(wav_filename));
             write_wav_file(wav_filename, saved_audio, saved_samples, SAMPLE_RATE);
             saved_samples = 0;
@@ -196,11 +203,11 @@ static void* transcribe(void* ptr) {
         }
 
         if (!flush) {
-            const SherpaOnnxDenoisedAudio* chunk = SherpaOnnxOnlineSpeechDenoiserRun(denoiser, audio, MIC_BUFFER_LEN, SAMPLE_RATE);
+            //const SherpaOnnxDenoisedAudio* chunk = SherpaOnnxOnlineSpeechDenoiserRun(denoiser, audio, MIC_BUFFER_LEN, SAMPLE_RATE);
 
-            if (chunk->sample_rate <= 48000 && chunk != NULL) {
-                //SherpaOnnxOnlineStreamAcceptWaveform(stream, SAMPLE_RATE, audio, MIC_BUFFER_LEN);
-                SherpaOnnxOnlineStreamAcceptWaveform(stream, chunk->sample_rate, chunk->samples, chunk->n);
+            if (/*chunk->sample_rate <= 48000 && chunk != NULL*/ 1) {
+                SherpaOnnxOnlineStreamAcceptWaveform(stream, SAMPLE_RATE, audio, MIC_BUFFER_LEN);
+                //SherpaOnnxOnlineStreamAcceptWaveform(stream, chunk->sample_rate, chunk->samples, chunk->n);
                 while (SherpaOnnxIsOnlineStreamReady(recognizer, stream)) {
                     SherpaOnnxDecodeOnlineStream(recognizer, stream);
                 }
@@ -217,21 +224,22 @@ static void* transcribe(void* ptr) {
 
                 SherpaOnnxDestroyOnlineRecognizerResult(r);
                 
-                if (chunk->n + saved_samples > 2 * SAMPLE_RATE) {
-                    int write_samples = 2 * SAMPLE_RATE - saved_samples;
-                    memcpy(&saved_audio[saved_samples], chunk->samples, write_samples * sizeof(float));
+                if (/*chunk->n*/MIC_BUFFER_LEN + saved_samples > MAX_TIME * SAMPLE_RATE) {
+                    int write_samples = MAX_TIME * SAMPLE_RATE - saved_samples;
+                    memcpy(&saved_audio[saved_samples], /*chunk->samples*/ audio, write_samples * sizeof(float));
                     saved_samples += write_samples;
                 } else {
-                    memcpy(&saved_audio[saved_samples], chunk->samples, chunk->n * sizeof(float));
-                    saved_samples += chunk->n;
+                    memcpy(&saved_audio[saved_samples], /*chunk->samples*/ audio, /*chunk->n*/ MIC_BUFFER_LEN * sizeof(float));
+                    //saved_samples += chunk->n;
+                    saved_samples += MIC_BUFFER_LEN;
                 }
             }
-            SherpaOnnxDestroyDenoisedAudio(chunk);
+            //SherpaOnnxDestroyDenoisedAudio(chunk);
         } else {
-            const SherpaOnnxDenoisedAudio* tail = SherpaOnnxOnlineSpeechDenoiserFlush(denoiser);
+            //const SherpaOnnxDenoisedAudio* tail = SherpaOnnxOnlineSpeechDenoiserFlush(denoiser);
             const float tail_padding[TAIL_PADDING_LENGTH] = {0};
 
-            if (tail) { SherpaOnnxOnlineStreamAcceptWaveform(stream, SAMPLE_RATE, tail->samples, tail->n); }
+            //if (tail) { SherpaOnnxOnlineStreamAcceptWaveform(stream, SAMPLE_RATE, tail->samples, tail->n); }
 
             SherpaOnnxOnlineStreamAcceptWaveform(stream, SAMPLE_RATE, tail_padding, TAIL_PADDING_LENGTH);
             SherpaOnnxOnlineStreamInputFinished(stream);
@@ -244,14 +252,11 @@ static void* transcribe(void* ptr) {
             //printf("\033[2K\r[%.2f] %s    \n", chance_of_speech, r->text);
             //fflush(stdout);
             printf("[%.2f] %s\n", chance_of_speech, r->text);
-
-            SherpaOnnxDestroyOnlineRecognizerResult(r);
-            SherpaOnnxOnlineStreamReset(recognizer, stream);
-            SherpaOnnxDestroyDenoisedAudio(tail);
-
-            if (tail) { 
-                if (tail->n + saved_samples > 2 * SAMPLE_RATE) {
-                    int write_samples = 2 * SAMPLE_RATE - saved_samples;
+            
+            /*
+             * if (tail) { 
+                if (tail->n + saved_samples > MAX_TIME * SAMPLE_RATE) {
+                    int write_samples = MAX_TIME * SAMPLE_RATE - saved_samples;
                     memcpy(&saved_audio[saved_samples], tail->samples, write_samples * sizeof(float));
                     saved_samples += write_samples;
                 } else {
@@ -259,10 +264,15 @@ static void* transcribe(void* ptr) {
                     saved_samples += tail->n;
                 }
             }
+            */
             make_wav_filename(wav_filename, sizeof(wav_filename));
             write_wav_file(wav_filename, saved_audio, saved_samples, SAMPLE_RATE);
             saved_samples = 0;
             memset(saved_audio, 0, sizeof(saved_audio));
+
+            SherpaOnnxDestroyOnlineRecognizerResult(r);
+            SherpaOnnxOnlineStreamReset(recognizer, stream);
+            //SherpaOnnxDestroyDenoisedAudio(tail);
         }
     }
 
@@ -501,7 +511,7 @@ int main() {
     float* mic_buffers[NUM_MICS] = {mic1_buffer, mic2_buffer, mic3_buffer, mic4_buffer, mic5_buffer};
     pthread_mutex_t* mic_mutexes[NUM_MICS] = {&mic1_mutex, &mic2_mutex, &mic3_mutex, &mic4_mutex, &mic5_mutex};
     pthread_cond_t* mic_conds[NUM_MICS] = {&mic1_cond, &mic2_cond, &mic3_cond, &mic4_cond, &mic5_cond};
-    float mic_gains[NUM_MICS] = {1.25f, 1.25f, 10.0f, 10.0f, 10.0f};
+    float mic_gains[NUM_MICS] = {1.0f, 3.0f, 1.0f, 1.0f, 1.0f};
 
     for (int i = 0; i < NUM_MICS; i++) {
         mic_data[i].buffer = mic_buffers[i];
@@ -569,7 +579,8 @@ int main() {
 
         // Accessing mic data ==========================================================================================
 
-        pthread_mutex_lock(node_1.mutex);
+        //pthread_mutex_lock(node_1.mutex);
+        pthread_mutex_lock(mic_data[3].mutex);
         pthread_mutex_lock(node_2->mutex);
         pthread_mutex_lock(node_3->mutex);
        
@@ -585,19 +596,19 @@ int main() {
         pthread_mutex_unlock(mic_data[2].mutex);
         */ 
 
-        if (node_1.data_ready && node_2->data_ready && node_3->data_ready) {
-            /*
+        if (/*node_1.data_ready*/mic_data[3].data_ready && node_2->data_ready && node_3->data_ready) {
+            
             for (int i = 0; i < MIC_BUFFER_LEN; i++) {
-                rms[0] += node_1.buffer[i] * node_1.buffer[i];
+                rms[0] += mic_data[3].buffer[i] * mic_data[3].buffer[i];
+                //rms[0] += node_1.buffer[i] * node_1.buffer[i];
                 rms[1] += node_2->buffer[i] * node_2->buffer[i];
                 rms[2] += node_3->buffer[i] * node_3->buffer[i];
             }
 
             const int highest_power = max(rms, 3);
-            //printf("rms = [ %.3f, %.3f, %.3f]\n", rms[0], rms[1], rms[2]);
             switch (highest_power) {
                 case 0:
-                    memcpy(combined_buffer, node_1.buffer, MIC_BUFFER_LEN * sizeof(float));
+                    memcpy(combined_buffer, /*node_1.buffer*/mic_data[3].buffer, MIC_BUFFER_LEN * sizeof(float));
                     break;
                 case 1:
                     memcpy(combined_buffer, node_2->buffer, MIC_BUFFER_LEN * sizeof(float));
@@ -607,24 +618,29 @@ int main() {
                     break;
                 default:
                     break;
-            }*/
-
-            for (int i = 0; i < MIC_BUFFER_LEN; i++)  {
-                combined_buffer[i] = node_1.buffer[i] + node_2->buffer[i] - node_3->buffer[i];
             }
 
-            node_1.data_ready = 0;
+            //for (int i = 0; i < MIC_BUFFER_LEN; i++)  {
+                //combined_buffer[i] = (node_1.buffer[i] + node_2->buffer[i] + node_3->buffer[i]) / 3;
+                //combined_buffer[i] = node_1.buffer[i];
+            //}
+
+            //node_1.data_ready = 0;
+            mic_data[3].data_ready = 0;
             node_2->data_ready = 0;
             node_3->data_ready = 0;
-            pthread_cond_signal(node_1.cond);
+            //pthread_cond_signal(node_1.cond);
+            pthread_cond_signal(mic_data[3].cond);
             pthread_cond_signal(node_2->cond);
             pthread_cond_signal(node_3->cond);
-            pthread_mutex_unlock(node_1.mutex);
+            //pthread_mutex_unlock(node_1.mutex);
+            pthread_mutex_unlock(mic_data[3].mutex);
             pthread_mutex_unlock(node_2->mutex);
             pthread_mutex_unlock(node_3->mutex);
         } else {
             // Don't want to run transcription
-            pthread_mutex_unlock(node_1.mutex);
+            //pthread_mutex_unlock(node_1.mutex);
+            pthread_mutex_unlock(mic_data[3].mutex);
             pthread_mutex_unlock(node_2->mutex);
             pthread_mutex_unlock(node_3->mutex);
             usleep(1000);
@@ -652,6 +668,8 @@ int main() {
         }
 
         if (peak_value >= speech_threshold) {
+            printf("rms = [ %.3f, %.3f, %.3f]\n", rms[0], rms[1], rms[2]);
+
             pthread_mutex_lock(transcribe_data.mutex);
 
             transcribe_data.ready = 1;
