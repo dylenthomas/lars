@@ -2,6 +2,7 @@ add_library(lars_core STATIC
         fft.c
         mic_access.c
         wav_writer.c
+        audio_and_transcription.c
 )
 
 target_include_directories(lars_core PUBLIC

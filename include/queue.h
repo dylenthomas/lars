@@ -1,14 +1,8 @@
-//
-// Created by dylenthomas on 2026-06-03.
-//
-
 #ifndef LARS_QUEUE_H
 #define LARS_QUEUE_H
 
 #include <stdio.h>
 #include <stdlib.h>
-
-#include "main.h"
 
 #define MAX_TRANSCRIPT_QUEUE_LENGTH 10
 
