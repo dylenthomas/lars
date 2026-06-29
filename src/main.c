@@ -8,11 +8,6 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#include "onnxruntime_c_api.h"
-#include "mic_access.h"
-#include "sherpa-onnx/c-api/c-api.h"
-#include "fft.h"
-
 // =====================================================================================================================
 // - 1 Corinthians 10:31
 // =====================================================================================================================
@@ -173,6 +168,10 @@ static void* transcribe(void* ptr) {
     const SherpaOnnxOnlineRecognizer* recognizer = args->recognizer;
     const SherpaOnnxOnlineStream* stream = args->stream;
     const SherpaOnnxOnlineSpeechDenoiser* denoiser = args->denoiser;
+    
+    static float saved_audio[2 * SAMPLE_RATE] = {0};
+    static int saved_samples = 0;
+    static char wav_filename[64];
 
     while (keep_running) {
         float audio[MIC_BUFFER_LEN] = {0};
@@ -188,6 +187,13 @@ static void* transcribe(void* ptr) {
         flush = args->flush;
         chance_of_speech = args->chance_of_speech;
         pthread_mutex_unlock(args->mutex);
+
+        if (saved_samples == 2 * SAMPLE_RATE) {
+            make_wav_filename(wav_filename, sizeof(wav_filename));
+            write_wav_file(wav_filename, saved_audio, saved_samples, SAMPLE_RATE);
+            saved_samples = 0;
+            memset(saved_audio, 0, sizeof(saved_audio));
+        }
 
         if (!flush) {
             const SherpaOnnxDenoisedAudio* chunk = SherpaOnnxOnlineSpeechDenoiserRun(denoiser, audio, MIC_BUFFER_LEN, SAMPLE_RATE);
@@ -210,6 +216,15 @@ static void* transcribe(void* ptr) {
                 }
 
                 SherpaOnnxDestroyOnlineRecognizerResult(r);
+                
+                if (chunk->n + saved_samples > 2 * SAMPLE_RATE) {
+                    int write_samples = 2 * SAMPLE_RATE - saved_samples;
+                    memcpy(&saved_audio[saved_samples], chunk->samples, write_samples * sizeof(float));
+                    saved_samples += write_samples;
+                } else {
+                    memcpy(&saved_audio[saved_samples], chunk->samples, chunk->n * sizeof(float));
+                    saved_samples += chunk->n;
+                }
             }
             SherpaOnnxDestroyDenoisedAudio(chunk);
         } else {
@@ -233,6 +248,21 @@ static void* transcribe(void* ptr) {
             SherpaOnnxDestroyOnlineRecognizerResult(r);
             SherpaOnnxOnlineStreamReset(recognizer, stream);
             SherpaOnnxDestroyDenoisedAudio(tail);
+
+            if (tail) { 
+                if (tail->n + saved_samples > 2 * SAMPLE_RATE) {
+                    int write_samples = 2 * SAMPLE_RATE - saved_samples;
+                    memcpy(&saved_audio[saved_samples], tail->samples, write_samples * sizeof(float));
+                    saved_samples += write_samples;
+                } else {
+                    memcpy(&saved_audio[saved_samples], tail->samples, tail->n * sizeof(float));
+                    saved_samples += tail->n;
+                }
+            }
+            make_wav_filename(wav_filename, sizeof(wav_filename));
+            write_wav_file(wav_filename, saved_audio, saved_samples, SAMPLE_RATE);
+            saved_samples = 0;
+            memset(saved_audio, 0, sizeof(saved_audio));
         }
     }
 

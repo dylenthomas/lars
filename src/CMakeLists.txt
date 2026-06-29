@@ -1,8 +1,7 @@
 add_library(lars_core STATIC
-        #config_parser.c
         fft.c
         mic_access.c
-        #queue.c
+        wav_writer.c
 )
 
 target_include_directories(lars_core PUBLIC
@@ -14,10 +13,6 @@ target_include_directories(lars_core PUBLIC
 target_link_libraries(lars_core PUBLIC
         ${ORT_LIB}
         ${ALSA_LIB}
-        ${MIC_LIB}
-        ${FFT_LIB}
-        ${TRANSC_LIB}
-        ${CNFG_PARSR}
         ${SHERPA_LIB}
         m
         CUDA::cudart

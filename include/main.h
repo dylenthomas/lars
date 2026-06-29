@@ -10,9 +10,10 @@
 #include <stdatomic.h>
 
 #include "onnxruntime_c_api.h"
-#include "mic_access.h"
 #include "sherpa-onnx/c-api/c-api.h"
+#include "mic_access.h"
 #include "fft.h"
+#include "wav_writer.h"
 
 // Mic characteristics
 #define MIC_BUFFER_LEN 512
