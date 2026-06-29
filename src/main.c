@@ -7,12 +7,12 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <time.h>
 
 // =====================================================================================================================
 // - 1 Corinthians 10:31
 // =====================================================================================================================
 
-// TODO: Add a flush delay of a few seconds
 // TODO: Start working on keyword identification
 // TODO: Include more robust error handling
 // TODO: Add "write to wav" flag
@@ -69,6 +69,7 @@ int main() {
     while (!kbhit()) {
         int hold_iterations = 5;
         const double speech_threshold = 0.7; // trigger threshold to start transcription
+        int64_t last_transcription_call = 0;
 
         float speech_prob;
         OrtValue** outputs = NULL;
@@ -128,8 +129,6 @@ int main() {
         }
 
         if (peak_value >= speech_threshold) {
-            printf("rms = [ %.3f, %.3f, %.3f]\n", rms[0], rms[1], rms[2]);
-
             pthread_mutex_lock(transcription_thread_data.mutex);
 
             transcription_thread_data.ready = 1;
@@ -141,7 +140,8 @@ int main() {
             pthread_mutex_unlock(transcription_thread_data.mutex);
 
             vad_previously_triggered = 1;
-        } else if (vad_previously_triggered) {
+            last_transcription_call = now_ms();
+        } else if (vad_previously_triggered && now_ms() - last_transcription_call >= FLUSH_DELAY_MS) {
             pthread_mutex_lock(transcription_thread_data.mutex);
 
             transcription_thread_data.ready = 1;
@@ -348,26 +348,12 @@ int initialize_mics_and_transcription() {
     } 
 
     // Setup threads ===================================================================================================
-    pthread_mutex_t transcribe_mutex = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t transcribe_cond = PTHREAD_COND_INITIALIZER;
     transcription_thread_data.recognizer = sherpa_recognizer;
     transcription_thread_data.stream = sherpa_stream;
     transcription_thread_data.cond = &transcribe_cond;
     transcription_thread_data.mutex = &transcribe_mutex;
     transcription_thread_data.ready = 0;
-
-    float mic1_buffer[MIC_BUFFER_LEN] = {0};
-    float mic2_buffer[MIC_BUFFER_LEN] = {0};
-    pthread_mutex_t mic1_mutex = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_t mic2_mutex = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t mic1_cond = PTHREAD_COND_INITIALIZER;
-    pthread_cond_t mic2_cond = PTHREAD_COND_INITIALIZER;
-
-    float* mic_buffers[NUM_MICS] = {mic1_buffer, mic2_buffer};
-    pthread_mutex_t* mic_mutexes[NUM_MICS] = {&mic1_mutex, &mic2_mutex};
-    pthread_cond_t* mic_conds[NUM_MICS] = {&mic1_cond, &mic2_cond};
-    float mic_gains[NUM_MICS] = {3.0f, 5.0f};
-
+    
     for (int i = 0; i < NUM_MICS; i++) {
         mic_thread_data[i].buffer = mic_buffers[i];
         mic_thread_data[i].device = mic_chs[i];
@@ -485,4 +471,10 @@ void* transcription_thread(void* ptr) {
     }
 
     return NULL;
+}
+
+static inline int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }

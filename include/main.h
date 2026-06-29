@@ -38,6 +38,8 @@
 
 #define MAX_WAV_TIME 5
 
+#define FLUSH_DELAY_MS 2000 
+
 struct mic_thread_data_struct {
     snd_pcm_t* device;
     pthread_mutex_t* mutex;
@@ -59,15 +61,15 @@ struct transcription_thread_data_struct {
     int flush;
 };
 
-int initialize_mics_and_transcription();
+int initialize_mics_and_transcription(void);
 
 void* mic_thread(void* ptr);
 
 void* transcription_thread(void* ptr);
 
-static const OrtApi* initializeORT();
+static const OrtApi* initializeORT(void);
 
-static int initializeSherpa();
+static int initializeSherpa(void);
 
 int kbhit(void);
 
@@ -76,6 +78,8 @@ static int max(const float values[], int num_vals);
 static int bad_ort_status(OrtStatus* status, const OrtApi* ort);
 
 float chance_of_speech(OrtValue*** outputs, const OrtApi* ort);
+
+static inline int64_t now_ms(void);
 
 // Assignments
 
@@ -120,5 +124,22 @@ struct transcription_thread_data_struct transcription_thread_data;
 
 atomic_int run_mic_threads = 0;
 atomic_int run_transcription_thread = 0;
+
+pthread_mutex_t transcribe_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t transcribe_cond = PTHREAD_COND_INITIALIZER;
+
+pthread_mutex_t mic1_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t mic1_cond = PTHREAD_COND_INITIALIZER;
+
+pthread_mutex_t mic2_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t mic2_cond = PTHREAD_COND_INITIALIZER;
+
+float mic1_buffer[MIC_BUFFER_LEN] = {0};
+float mic2_buffer[MIC_BUFFER_LEN] = {0};
+
+float* mic_buffers[NUM_MICS] = {mic1_buffer, mic2_buffer};
+pthread_mutex_t* mic_mutexes[NUM_MICS] = {&mic1_mutex, &mic2_mutex};
+pthread_cond_t* mic_conds[NUM_MICS] = {&mic1_cond, &mic2_cond};
+float mic_gains[NUM_MICS] = {3.0f, 5.0f};
 
 #endif //LARS_MAIN_H
